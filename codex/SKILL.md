@@ -502,14 +502,23 @@ Three Codex behaviours matter for this skill:
 Every path in this document is relative to the directory that contains this `SKILL.md`. Codex does
 not expand a skill-directory placeholder, so set the path explicitly before running anything:
 
-```bash
-# Personal install (the normal case)
-SKILL_DIR="$HOME/.agents/skills/ssh-server-manager"
-# If you are running from a repo checkout instead, point at the skill folder inside it, e.g.
-# SKILL_DIR="$PWD/codex"
+**Do not guess this path.** Codex resolves the skill from one of several roots, and the folder it
+actually loaded from is the correct one:
 
-ls "$SKILL_DIR/scripts" || echo "wrong SKILL_DIR"
+- personal: `~/.agents/skills/ssh-server-manager`
+- project:  `<repo>/.agents/skills/ssh-server-manager`
+- this skill's own source repo: the `codex/` folder
+
+Check in this order and stop at the first that exists:
+
+```bash
+for d in "$HOME/.agents/skills/ssh-server-manager" ".agents/skills/ssh-server-manager" codex; do
+  [ -f "$d/SKILL.md" ] && SKILL_DIR="$(cd "$d" && pwd)" && break
+done
+[ -n "${SKILL_DIR:-}" ] && ls "$SKILL_DIR/scripts" || echo "skill dir not found — stop and ask"
 ```
+
+If the loop finds nothing, stop and tell the user; do not fall back to a hard-coded `$HOME` path.
 
 Run all scripts with `bash` explicitly — do not rely on the executable bit surviving a copy:
 
@@ -517,13 +526,95 @@ Run all scripts with `bash` explicitly — do not rely on the executable bit sur
 bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 -c 'df -h'
 ```
 
-**Windows: run these from Git-Bash, not PowerShell or `cmd.exe`.** The scripts are bash and the
-password path executes a POSIX askpass helper that the native `ssh.exe` cannot run. Inside Git-Bash
-the paths above work unchanged; if Codex's shell is PowerShell, launch
-`bash -lc '<command>'` instead. Verify once with:
+### Running on Windows (PowerShell)
+
+The scripts are bash, and the password path executes a POSIX askpass helper that the Windows-native
+`ssh.exe` cannot run, so everything must go through Git-Bash's bash. Two traps are **measured**, not
+theoretical — both were reproduced on Windows 11 with PowerShell 5.1:
+
+**Trap 1 — `$SKILL_DIR` is a PowerShell variable, not a bash one.**
+
+```powershell
+# WRONG: PowerShell expands $SKILL_DIR (empty) and bash sees /scripts/ssh_exec.sh -> exit 127
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 -c 'df -h'
+```
+
+Assign it in PowerShell. `~` is not expanded by every Windows API, so resolve a real absolute path:
+
+```powershell
+$SKILL_DIR = (Resolve-Path "$HOME/.agents/skills/ssh-server-manager").Path
+bash "$SKILL_DIR/scripts/ssh_exec.sh" --selftest
+```
+
+In Git-Bash itself, the bash form is correct and simpler: `SKILL_DIR=~/.agents/skills/ssh-server-manager`.
+
+**Trap 2 — never wrap the call in `bash -lc '...'` with double-quoted arguments.** PowerShell strips
+embedded double quotes when it hands arguments to a native executable, so the remote command is
+split and only its first word reaches the script:
+
+```powershell
+# WRONG: bash receives `-c systemctl restart nginx`; the script sees -c "systemctl".
+# Risk tiering silently degrades: `systemctl restart nginx` is reported as tier0/read-only
+# instead of tier1/mutating, and the mutation guard never fires.
+bash -lc 'SKILL_DIR=...; bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 -c "systemctl restart nginx"'
+```
+
+Pass the remote command as a **single-quoted** argument, escaping any single quote inside it by
+doubling it (`''`). Single-quoted PowerShell strings also stop `$9`, `$7`, and `>` from being
+mangled, which matters for `awk` pipelines:
+
+```powershell
+# Single quotes: correct, and the tier is classified from the full command
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 -c 'awk ''$9==502 {print $7}'' /var/log/nginx/access.log | sort | uniq -c'
+```
+
+If the command does get split, `ssh_exec.sh` now **refuses** rather than silently running a
+truncated version: `命令已被 -c/-f 指定，却又收到多余的位置参数` (`a command was already given via
+-c/-f, yet extra positional arguments arrived`) and exits 1. Seeing that message means the outer
+shell ate your quotes — fix the quoting and re-run; do not "simplify" by dropping the quotes.
+
+For anything longer than a one-liner, or whenever quoting gets awkward, write the remote command to
+a file and pass it with `-f` — this sidesteps argument quoting entirely.
+
+**Use a relative path or a full Windows path, never `/tmp`.** PowerShell resolves `/tmp` against the
+current drive (`D:\tmp`) while Git-Bash maps `/tmp` to `C:\WINDOWS\TEMP`; a file written by one is
+invisible to the other, and you get `脚本文件不存在` (`script file not found`).
+
+```powershell
+$env:SSHMGR_HOME = (Join-Path (Get-Location) ".tmp-home")
+'df -hPT -x tmpfs; df -iP' | Out-File -Encoding ascii -NoNewline .\cmd.tmp.sh
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 -f ./cmd.tmp.sh
+Remove-Item .\cmd.tmp.sh
+```
+
+A script passed with `-f` is classified as **tier 1** (mutating), because its contents cannot be
+statically analysed — even when it only reads. That is intended: put read-only collectors in this
+skill's `scripts/` directory (they carry a `# sshmgr:read-only` marker) rather than in a temp file.
+
+**Always confirm the classification before trusting it.** `--dry-run` prints the reconstructed
+command and the tier — if the printed command is shorter than what you sent, the shell mangled it:
 
 ```bash
-bash "$SKILL_DIR/scripts/ssh_exec.sh" --selftest
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 --dry-run -c '<the real command>'
+```
+
+**Do not pipe a script's output into a PowerShell cmdlet that stops early.** `bash ... | Select-Object
+-First 3` closes the pipe while bash is still writing, and Git-Bash reports
+`couldn't create signal pipe, Win32 error 5` — noise that looks like a script failure but is not.
+Redirect to a file and read it back instead, which also keeps the output's UTF-8 intact:
+
+```powershell
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 --selftest > .\out.tmp.txt 2>&1
+Get-Content -Encoding UTF8 .\out.tmp.txt
+Remove-Item .\out.tmp.txt
+```
+
+**Reading this skill's files on Windows.** PowerShell's console encoding here is GBK, so a plain
+`cat SKILL.md` or `Get-Content SKILL.md` renders this document's Chinese as mojibake. Read UTF-8
+explicitly:
+
+```powershell
+Get-Content -Encoding UTF8 "$SKILL_DIR/SKILL.md"      # note the hyphen: -Encoding, not --encoding
 ```
 
 If `--selftest` reports the Windows-native ssh (under `System32`), point `SSHMGR_SSH` at the

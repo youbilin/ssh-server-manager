@@ -183,7 +183,25 @@ while [ $# -gt 0 ]; do
     -h|--help)         usage; exit 0 ;;
     --)                shift; COMMAND="$*"; break ;;
     -*)                err "未知选项: $1（用 --help 查看用法）"; exit 1 ;;
-    *)                 if [ -z "$HOST" ]; then HOST="$1"; shift; else COMMAND="$*"; break; fi ;;
+    *)
+      if [ -z "$HOST" ]; then
+        HOST="$1"; shift
+      elif [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ]; then
+        # -c/-f 已经给出命令，却还有裸的位置参数：这几乎总是"命令没被引号包住"，
+        # 被外层 shell（PowerShell 尤其常见）拆成了多个参数。
+        # 以前这里直接 COMMAND="$*" 覆盖：对 -c 是**改变了要执行的命令**，
+        # 于是风险分级作用在另一个片段上 —— `-H h -c systemctl restart nginx`
+        # 被判成 tier0，而真正跑的是被截断的部分；对 -f 则是把审计日志记成别的命令。
+        # 静默改变要执行/要记录的内容比报错危险得多，所以这里直接拒绝。
+        err "命令已被 -c/-f 指定，却又收到多余的位置参数: $*"
+        err "  -c 的命令必须整体加引号；否则外层 shell 会把它拆成多个参数，"
+        err "  风险分级将作用在被截断的片段上（高危命令可能被误判为只读）。"
+        err "  正确写法: -c '<完整命令>'  或改用 -- <完整命令>"
+        exit 1
+      else
+        COMMAND="$*"; break
+      fi
+      ;;
   esac
 done
 
