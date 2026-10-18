@@ -80,7 +80,15 @@ cannot execute shebang scripts, so the askpass helper fails and password login b
 
 ## Installation
 
-The skill is a directory. Clone it into your Claude Code skills path:
+The repository ships two builds of the same skill. Both share the scripts, references, and
+inventory template; they differ only in the `SKILL.md` at the root of the skill folder.
+
+| Harness | Skill folder in this repo | Install to |
+|---|---|---|
+| Claude Code | repository root | `~/.claude/skills/ssh-server-manager` |
+| Codex | [`codex/`](codex/) | `~/.agents/skills/ssh-server-manager` |
+
+**Claude Code**
 
 ```bash
 # macOS / Linux
@@ -90,8 +98,30 @@ git clone https://github.com/youbilin/ssh-server-manager.git ~/.claude/skills/ss
 git clone https://github.com/youbilin/ssh-server-manager.git "$USERPROFILE/.claude/skills/ssh-server-manager"
 ```
 
-`SKILL.md` must sit at the root of that directory. A symlink works equally well if you prefer to
-keep the working copy elsewhere.
+**Codex**
+
+```bash
+git clone https://github.com/youbilin/ssh-server-manager.git /tmp/ssm
+mkdir -p ~/.agents/skills
+cp -r /tmp/ssm/codex ~/.agents/skills/ssh-server-manager
+```
+
+Or, for a single project only, copy `codex/` to `<repo>/.agents/skills/ssh-server-manager`.
+Codex scans `.agents/skills` from the current directory up to the repository root, plus
+`~/.agents/skills` for personal skills.
+
+`SKILL.md` must sit at the root of the installed folder. A symlink works equally well if you prefer
+to keep the working copy elsewhere.
+
+### What differs between the two builds
+
+| | Claude Code build | Codex build |
+|---|---|---|
+| Frontmatter | `name`, `description`, `compatibility` | `name`, `description` only |
+| Path resolution | Paths relative to the skill folder | Explicit `$SKILL_DIR`, since Codex does not expand a skill placeholder |
+| Invocation | Model-invoked from the description | Same, plus `agents/openai.yaml` UI metadata |
+| Sandbox guidance | — | Notes that Codex approval prompts are not a substitute for the remote-change confirmation, and that a sandboxed network error must be reported rather than worked around |
+| Launch | `scripts/ssh_exec.sh …` | `bash "$SKILL_DIR/scripts/ssh_exec.sh" …` |
 
 ## Quick start
 
@@ -265,9 +295,14 @@ client, not the IP — addresses are recycled and NAT blurs them. A mismatch wri
 
 ```
 .
-├── SKILL.md                      # skill definition loaded by Claude Code
+├── SKILL.md                      # Claude Code skill definition
 ├── README.md
 ├── LICENSE
+├── codex/                        # Codex build of the same skill
+│   ├── SKILL.md                  # Codex skill definition (name + description only)
+│   ├── agents/openai.yaml        # Codex UI metadata
+│   ├── LICENSE.txt
+│   └── scripts|references|assets # copies of the shared material
 ├── scripts/
 │   ├── ssh_exec.sh               # execution wrapper (tiering, audit, diagnosis)
 │   ├── health_check.sh           # remote inspection
@@ -287,6 +322,15 @@ Issues and pull requests are welcome. The scripts target `bash` 4 and must keep 
 Linux, and Git-Bash on Windows. Run `bash -n` over `scripts/*.sh` and
 `scripts/ssh_exec.sh --selftest` before submitting. Please preserve the `# sshmgr:read-only` header
 marker on read-only collectors — the wrapper relies on it for tiering.
+
+`codex/scripts`, `codex/references`, and `codex/assets` are copies of the root directories. When you
+edit one, copy it across and keep the only intentional difference limited to path spelling
+(`$SKILL_DIR/scripts/...` in the Codex build). Verify with:
+
+```bash
+diff -rq scripts codex/scripts && diff -rq assets codex/assets
+diff -r references codex/references   # only $SKILL_DIR path differences expected
+```
 
 ## License
 

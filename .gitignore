@@ -13,3 +13,7 @@ credentials
 Thumbs.db
 *.swp
 *~
+
+# Local skill install used for Codex testing
+.agents/
+.tmp-home/
