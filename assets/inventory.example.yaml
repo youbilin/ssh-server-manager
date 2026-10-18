@@ -1,0 +1,121 @@
+# ============================================================================
+# Server inventory template
+#
+# Copy it to your own inventory.yaml and use that:
+#   cp assets/inventory.example.yaml ~/.ssh-server-manager/inventory.yaml
+#
+# Usage:
+#   ./scripts/batch_run.sh --inventory ~/.ssh-server-manager/inventory.yaml \
+#     --tags web --cmd 'uptime'
+#
+# Security conventions -- this file ends up in git and gets pasted into chats, so:
+#   * Write only the [private key file PATH] (identity_file); never a password or key contents
+#   * For password-login hosts, do NOT put the password here. Supply it at call time via one of:
+#       --prompt-credential        interactive input (never enters shell history)
+#       --password-env VAR         read from an environment variable
+#       --credential-file F        read from a file
+#     batch_run.sh passes these through to each host's ssh_exec.sh
+#   * If internal addresses / hostnames count as sensitive, don't commit this file publicly
+#
+# Server profiles (~/.ssh-server-manager/profiles/) automatically record each machine's real IP,
+# hostname, and hardware/service inventory, so the aliases here and the profiles find each other.
+# Profiles contain infrastructure detail too -- likewise do not commit them publicly.
+# ============================================================================
+
+# Fields under defaults are overridden by the same field on an individual host, to avoid repetition.
+defaults:
+  user: deploy
+  port: 22
+  identity_file: ~/.ssh/id_ed25519
+  # auth: auto | key | password
+  #   auto (default)  use a key if one works, otherwise use a password -- usually omit this
+  #   password        explicitly use a password (disables pubkey attempts, so a pile of keys
+  #                   in ssh-agent doesn't burn through MaxAuthTries)
+  # auth: auto
+  # Global jump host; override `jump` on a host that needs a different one
+  jump: bastion
+
+hosts:
+  # ---------------------------------------------------------------------------
+  # Keep `alias` consistent with the Host entry in ~/.ssh/config.
+  # That way ssh_exec.sh and batch_run.sh calls are equivalent and you only need
+  # to remember one name. The matching ssh config stanzas:
+  #
+  #   Host bastion
+  #       HostName 198.51.100.5
+  #       User ops
+  #       IdentityFile ~/.ssh/id_ed25519
+  #
+  #   Host web1
+  #       HostName 203.0.113.10
+  #       User deploy
+  #       Port 2222
+  #       ProxyJump bastion
+  # ---------------------------------------------------------------------------
+  - alias: bastion
+    host: 198.51.100.5
+    user: ops
+    port: 22
+    jump: ""                 # the jump host itself needs no further hop
+    tags: [bastion, prod]
+    note: "Operations entry point; confirm this path still works before changing firewall/sshd"
+
+  - alias: web1
+    host: 203.0.113.10
+    user: deploy
+    port: 2222
+    tags: [web, prod]
+    note: "Primary web frontend, nginx + php-fpm"
+
+  - alias: web2
+    host: 203.0.113.11
+    user: deploy
+    port: 2222
+    tags: [web, prod]
+    note: "Secondary web frontend; same config as web1, safe to restart in batches"
+
+  - alias: app1
+    host: 203.0.113.20
+    user: deploy
+    port: 22
+    tags: [app, prod]
+    note: "Backend application; deployed via git pull --ff-only"
+
+  - alias: db1
+    host: 203.0.113.30
+    user: dba
+    port: 22
+    # The database network is isolated from the application network; uses its own jump host
+    jump: bastion-db
+    identity_file: ~/.ssh/id_ed25519_dba
+    tags: [db, prod]
+    note: "Primary database. DROP/TRUNCATE are dangerous; confirm backups are usable before changing anything"
+
+  # A password-login host: note that **no password goes here**. Supply it at call time with
+  # --prompt-credential / --password-env / --credential-file.
+  #   ./scripts/ssh_exec.sh -H legacy1 -u root --prompt-credential -c 'uptime'
+  #   ./scripts/batch_run.sh --hosts 'legacy1 legacy2' --cmd 'uptime' --prompt-credential
+  - alias: legacy1
+    host: 203.0.113.60
+    user: root
+    port: 22
+    auth: password
+    tags: [legacy, staging]
+    note: "Legacy system that only supports password login. Confirm a VNC fallback exists before changes"
+
+  - alias: stage1
+    host: 203.0.113.50
+    user: deploy
+    port: 22
+    tags: [web, app, staging]
+    note: "Staging; validate changes here before pushing to prod"
+
+  # ---------------------------------------------------------------------------
+  # Common tag conventions (used by batch_run.sh --tags):
+  #   prod      all production machines -- before a dangerous op, double-check you didn't select this
+  #   web       frontend / gateway
+  #   app       application services
+  #   db        databases
+  #   staging   staging (safe to break)
+  #   bastion   jump hosts
+  # ---------------------------------------------------------------------------

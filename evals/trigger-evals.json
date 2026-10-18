@@ -1,0 +1,142 @@
+[
+  {
+    "query": "帮我看下 203.0.113.10 这台机器的磁盘，感觉快满了，我密钥在 ~/.ssh/id_ed25519",
+    "should_trigger": true,
+    "note": "Most typical trigger: remote host + read-only inspection intent"
+  },
+  {
+    "query": "web1 上的 nginx 重启一下",
+    "should_trigger": true,
+    "note": "Mutating operation; needs risk tiering and a confirmation step"
+  },
+  {
+    "query": "网站从早上开始一直 502，帮我查下服务器怎么回事",
+    "should_trigger": true,
+    "note": "Troubleshooting; colloquial Chinese, SSH never mentioned"
+  },
+  {
+    "query": "把本地 dist 目录同步到 web1 的 /srv/app/dist/，用 rsync 带进度",
+    "should_trigger": true,
+    "note": "File upload"
+  },
+  {
+    "query": "我们内网的 db 机器要先 ssh 到跳板机才能连，你帮我配一下然后看看它负载高不高",
+    "should_trigger": true,
+    "note": "Jump host + inspection"
+  },
+  {
+    "query": "帮我看看这台服务器最近谁登录过，有没有异常 IP",
+    "should_trigger": true,
+    "note": "Security audit intent"
+  },
+  {
+    "query": "can you ssh into the prod box and figure out why the app keeps crashing every few hours",
+    "should_trigger": true,
+    "note": "English trigger"
+  },
+  {
+    "query": "服务器 CPU 跑满了，top 里全是 php-fpm，我现在该怎么办",
+    "should_trigger": true,
+    "note": "Resource troubleshooting"
+  },
+  {
+    "query": "批量给 web1 web2 web3 这三台装一下 fail2ban，然后确认服务起来了",
+    "should_trigger": true,
+    "note": "Adjacent domain: install fail2ban on servers, then verify the service — still server ops"
+  },
+  {
+    "query": "帮我把 sshd_config 改成禁止密码登录，顺便把 root 登录也关了",
+    "should_trigger": true,
+    "note": "Dangerous change: disabling password login risks lockout; needs backup/syntax check/rollback"
+  },
+  {
+    "query": "帮我写一个 Python 库，用来封装 SSH 连接和命令执行，要支持跳板机",
+    "should_trigger": false,
+    "note": "Adjacent domain: writing a Python library that wraps SSH — writing code, not an ops session"
+  },
+  {
+    "query": "我自己的 Windows 笔记本 C 盘快满了，怎么清理",
+    "should_trigger": false,
+    "note": "Adjacent domain: local Windows C: drive full — local machine troubleshooting, not SSH"
+  },
+  {
+    "query": "解释一下 SSH 密钥认证的原理，公钥私钥到底是怎么校验的",
+    "should_trigger": false,
+    "note": "Knowledge question: how key-based auth proves key possession; no command needed"
+  },
+  {
+    "query": "帮我优化一下这个 Dockerfile，构建太慢了",
+    "should_trigger": false,
+    "note": "Adjacent domain: optimizing a Dockerfile — Docker, but no remote server"
+  },
+  {
+    "query": "我在本机用 docker compose 起了个测试环境，帮我看看编排文件写得对不对",
+    "should_trigger": false,
+    "note": "Adjacent domain: docker compose on this machine, checking the file locally — local, not remote ops"
+  },
+  {
+    "query": "这个 nginx.conf 是同事发我的，你帮我看看有没有问题",
+    "should_trigger": false,
+    "note": "Adjacent domain: nginx.conf on the same machine — local file check, no remote component"
+  },
+  {
+    "query": "git 合并冲突了怎么解决，我这个分支落后主分支好多",
+    "should_trigger": false,
+    "note": "Adjacent domain: git merge conflicts — git work, not ops"
+  },
+  {
+    "query": "VSCode 的 Remote-SSH 插件怎么配置才能连上公司的开发机",
+    "should_trigger": false,
+    "note": "Adjacent domain: VSCode Remote-SSH setup — editor configuration, not ops"
+  },
+  {
+    "query": "什么是 502 Bad Gateway？和 504 有什么区别",
+    "should_trigger": false,
+    "note": "Conceptual question: no concrete host or action"
+  },
+  {
+    "query": "帮我给这个项目写一份 README，说明怎么部署到生产环境",
+    "should_trigger": false,
+    "note": "Adjacent domain: writing a README — documentation, not server operations"
+  },
+  {
+    "query": "203.0.113.10 这台机器怎么用账号密码登录？我只有 root 和一个密码，不想配密钥",
+    "should_trigger": true,
+    "note": "Password login: must trigger, and must not push the user toward keys"
+  },
+  {
+    "query": "第一次连这台新服务器，帮我看看什么配置，装了什么服务",
+    "should_trigger": true,
+    "note": "First-contact collection -> profile"
+  },
+  {
+    "query": "上次你看过 web1 了，它当时是什么配置来着",
+    "should_trigger": true,
+    "note": "Read the profile; must not re-reconnoiter"
+  },
+  {
+    "query": "对比一下这几台机器的硬件配置差异",
+    "should_trigger": true,
+    "note": "Cross-host profile comparison"
+  },
+  {
+    "query": "这台服务器的 Docker 服务清单给我看一下",
+    "should_trigger": true,
+    "note": "Profile / container inventory"
+  },
+  {
+    "query": "帮我在这台机器上跑个 sysbench 看看 CPU 性能",
+    "should_trigger": true,
+    "note": "Still in scope: must trigger, and be blocked by the benchmark prohibition"
+  },
+  {
+    "query": "怎么用 Python 写一个异步 HTTP 客户端",
+    "should_trigger": false,
+    "note": "Unrelated to ops/SSH"
+  },
+  {
+    "query": "帮我改一下本地这个 React 组件的样式",
+    "should_trigger": false,
+    "note": "Frontend task; must not trigger"
+  }
+]

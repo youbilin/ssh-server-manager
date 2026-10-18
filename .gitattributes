@@ -1,0 +1,4 @@
+# Keep the scripts byte-identical on checkout: a CRLF shebang breaks them on Linux/macOS
+# and inside the remote `bash -s` pipe. Force LF for everything text.
+* text=auto eol=lf
+*.sh text eol=lf

@@ -1,0 +1,15 @@
+# Local runtime state created by the scripts — NEVER commit these.
+# Profiles, audit logs and saved credentials contain infrastructure detail
+# (IPs, hostnames, image lists) and possibly passwords.
+.ssh-server-manager/
+*.profile
+*.partial
+audit.log
+askpass.log
+credentials
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

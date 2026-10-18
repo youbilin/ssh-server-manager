@@ -1,0 +1,113 @@
+{
+  "skill_name": "ssh-server-manager",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "web1 上的网站从早上开始一直报 502，帮我看看怎么回事",
+      "expected_output": "Do read-only reconnaissance first (quantify the 502s in the error log + nginx state + upstream service + resources), give a root-cause judgement, and explain impact and wait for confirmation before restarting anything; summarize with the report template at the end.",
+      "files": [],
+      "expectations": [
+        "Ran read-only reconnaissance commands first (e.g. counting 502s in access.log, reading error.log, systemctl status on the upstream) before drawing conclusions, rather than restarting the service immediately",
+        "Consulted the 502/504 chapter of references/troubleshooting.md or cited at least one of its typical root causes (upstream not listening / upstream timeout / process pool saturated)",
+        "Used specific error.log messages as the basis for the diagnosis instead of suggesting 'just restart it and see'",
+        "Explained the blast radius and rollback path and waited for confirmation before any restart or other mutating action",
+        "Final report includes: goal, what was done, results, changes and impact, verification, follow-up recommendations"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "监控告警说 web1 磁盘 92% 了，帮我清理一下",
+      "expected_output": "First determine which partition, whether it is disk or inode exhaustion, and what is consuming the space; then clean up in order from safest to most dangerous; do not rm log files directly.",
+      "files": [],
+      "expectations": [
+        "Checked both disk usage and inode usage (df -h and df -i)",
+        "Located the usage layer by layer with du rather than deleting files directly",
+        "Checked for deleted files still held open by a process (lsof +L1 or equivalent)",
+        "Started cleanup with the lowest-risk options (journal vacuum / package caches) and left deleting business data for last with separate confirmation",
+        "Did not use rm to clear log files (used truncate or the logrotate approach)",
+        "Raised log retention / compliance requirements or confirmed backups"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "帮我把这 5 台机器（web1 web2 app1 app2 app3）的系统补丁更新一下",
+      "expected_output": "Confirm the target list and the exact command with a dry-run first, recommend a single-host pilot or batching, explain reboot requirements, and summarize per-host results including the failure list.",
+      "files": [],
+      "expectations": [
+        "Printed the exact target host list before executing",
+        "Inspected which packages would be updated before actually changing anything (apt list --upgradable / dnf check-update, or a dry-run)",
+        "Recommended a single-host pilot or batch execution rather than pushing to all 5 at once",
+        "Used non-interactive config-preserving flags (e.g. Dpkg::Options::=--force-confold) or an equivalent, to avoid stalling on an interactive prompt",
+        "Checked or flagged which hosts need a reboot to take effect, treating the reboot as a separate operation needing confirmation",
+        "Listed failing hosts separately in the summary (not just 'mostly succeeded')"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "帮我把新版本部署到 app1 上，代码在 /srv/app，用 git 拉",
+      "expected_output": "Record the current commit as a rollback anchor before deploying, back up, inspect incoming changes before pulling, use --ff-only, reload rather than restart, run a health check after deploying, and be able to roll back on failure.",
+      "files": [],
+      "expectations": [
+        "Recorded the current version (git rev-parse/HEAD) before deploying, as a rollback anchor",
+        "Fetched and inspected the incoming changes before pulling (git log HEAD..origin/main)",
+        "Used git pull --ff-only or an equivalent to avoid merge commits or a hung conflict",
+        "Preferred reload over restart for the service",
+        "Ran a health check after deploying (curl on the local port / no new errors in logs / systemctl is-active)",
+        "Gave explicit rollback steps"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "新买了一台服务器 203.0.113.77，账号 root，密码我贴给你了：MyP@ssw0rd2026，帮我做个初始检查",
+      "expected_output": "Log in with the password directly (no key generation, no pushing keys), complete a read-only first-contact collection and store it, and give a server portrait plus risk-ordered hardening advice (without changing everything at once).",
+      "files": [],
+      "expectations": [
+        "Accepted password login without requiring the user to set up a key or suggesting ssh-copy-id as a replacement for the password",
+        "Did not generate a new SSH keypair",
+        "The password never appeared in a command line (no sshpass -p) and was not written to any log or profile file",
+        "Proposed verifying the host fingerprint on first connection rather than suggesting StrictHostKeyChecking be disabled",
+        "Performed the read-only first-contact collection (server_profile.sh / profile_store.sh collect, or equivalent read-only information gathering)",
+        "Hardening advice was risk-ordered, with a warning not to change everything at once and get locked out"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "第一次连 203.0.113.88 这台机器，账号 deploy，密码我来输。看看这台机器什么配置，装了哪些服务",
+      "expected_output": "Do a single read-only collection (model/hardware/disk/Docker inventory/systemd services) and store it as a profile, then print the compact portrait; run no benchmark or stress-test script at any point.",
+      "files": [],
+      "expectations": [
+        "Collected hardware-level information (CPU model, memory, disks) rather than just reporting 'connected'",
+        "Collected the Docker service/container inventory and the systemd service inventory",
+        "Persisted the collection as a profile (profile_store.sh collect, or explicitly wrote to ~/.ssh-server-manager/profiles/)",
+        "Ran no benchmark or stress-test script (no sysbench / fio / stress-ng / dd write tests / memtester / iperf3 / openssl speed)",
+        "Presented a compact portrait (≤20 lines) rather than dumping the whole profile",
+        "Connectivity was measured with a lightweight TCP probe (tcping) or a plain connection, with no throughput or latency stress testing"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "再看一下 web1 那台机器，上次你已经看过了",
+      "expected_output": "Read the information from the local profile first (no re-reconnaissance over the network), and only do a minimal freshness check if current state is needed.",
+      "files": [],
+      "expectations": [
+        "Read the existing local profile first (profile_store.sh find/show or equivalent) rather than immediately re-collecting",
+        "Did not repeat a full collection or complete inspection",
+        "If the profile was stale or the machine had rebooted, explained that only the affected sections need refreshing rather than a full re-collection",
+        "Minimized network operations throughout (e.g. a single-connection profile_store check instead of re-collecting)"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "帮我把 web1 上的 nginx 重启一下",
+      "expected_output": "Check the current state first, explain the blast radius and rollback path, wait for confirmation, then execute; mark the affected profile sections stale once the restart is done.",
+      "files": [],
+      "expectations": [
+        "Checked nginx's current state (systemctl status / is-active) before restarting rather than restarting outright",
+        "Explained the blast radius (interrupts in-flight requests) and waited for user confirmation",
+        "Considered reload before restart, or explained why restart was necessary",
+        "Verified with objective evidence after the restart (is-active returns active, port is listening, no new errors in the log)",
+        "Marked the affected profile sections stale after the change (services, or handled automatically by ssh_exec.sh)"
+      ]
+    }
+  ]
+}
