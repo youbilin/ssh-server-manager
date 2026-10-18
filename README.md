@@ -1,43 +1,86 @@
+<div align="center">
+
 # ssh-server-manager
 
-一个面向 Claude Code 的 **SSH 服务器运维 Skill**：把「远程操作如何不闯祸」写成可执行的机制，
-而不是靠自觉。
+**Safety-first SSH operations for Linux servers — packaged as a Claude Code skill.**
 
-它支持**账号密码直接登录**（不需要先配密钥），把风险分级、二次确认、审计留痕、
-服务器档案缓存、连接诊断这些事做成了脚本里的默认行为。
+Read-only reconnaissance before action · risk-tiered command gating · immutable audit trail ·
+cached per-host server profiles
 
-[English summary](#english) · [SKILL.md](SKILL.md) · [故障排查手册](references/troubleshooting.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Shell](https://img.shields.io/badge/shell-bash%204%2B-4EAA25?logo=gnubash&logoColor=white)](#requirements)
+[![Target](https://img.shields.io/badge/target-Linux-0b7285?logo=linux&logoColor=white)](#requirements)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-d97757)](https://claude.com/claude-code)
+
+[Overview](#overview) · [Install](#installation) · [Quick start](#quick-start) · [Scripts](#script-reference) · [Safety model](#how-the-safety-model-works) · [Security](#security-model) · [Docs](#documentation)
+
+</div>
 
 ---
 
-## 它解决什么问题
+## Overview
 
-远程运维有三件事天然容易出事：
+`ssh-server-manager` is a [Claude Code](https://claude.com/claude-code) skill for operating remote
+Linux hosts over SSH. It exists because three properties of remote work make the conventional
+"run the command and see what happens" workflow unsafe:
 
-1. **远程操作很难撤销。** 本地删错可能有快照，远端 `rm -rf` 通常什么都没有。
-2. **改 SSH / 防火墙会把自己锁在外面。** 改错一行 `sshd_config`，唯一的退路只剩云控制台的 VNC。
-3. **批量会把错误放大。** 对 1 台是改动，对 50 台是事故。
-
-所以这个 skill 的三条硬规则是：**先只读侦察再动手**、**改 SSH/防火墙前先留退路**、
-**批量执行前先打印确切目标清单**。其余流程按需取用，不搞固定套路。
-
-## 特性
-
-| 能力 | 说明 |
+| Property | Consequence |
 |---|---|
-| 🔐 密码登录开箱即用 | 走 ssh 自带的 `SSH_ASKPASS`，**不需要 sshpass**；口令不进命令行、不进 `ps`、不进审计日志 |
-| 🧭 风险分级 | 只读 / 变更 / 高危三级；高危命令默认拒绝，必须显式 `--confirm-danger` |
-| 📝 审计日志 | 每条远程命令记 `时间 \| 主机 \| 风险级 \| 退出码 \| 耗时 \| 命令` |
-| 🗂 服务器档案 | 首次接触采集一次硬件/服务/磁盘基线，之后查本地缓存，不重复侦察；身份用 machine_id + 主机密钥指纹校验 |
-| 🩺 一键巡检 | `health_check.sh` 输出结构化报告，末尾给 `SSHMGR_VERDICT=OK\|WARN\|CRIT` |
-| 🔌 连接诊断 | 把 ssh 报错翻译成「下一步查什么」；`--selftest` 一屏自检环境 |
-| 🚫 拒绝压测 | `sysbench`/`fio`/`stress-ng` 等基准测试被判为高危并默认拒绝——生产机上跑压测既污染监控又伤业务 |
-| 🧯 配置变更协议 | 备份 → 语法检查 → 自动回滚定时器 → 新会话验证，四步锁死 |
-| 🖥 批量执行 | 按 tag 选机器、并发执行、逐台日志、失败清单单独列出 |
+| Remote actions are hard to undo | A local `rm` may have a snapshot behind it; a remote `rm -rf` usually has nothing |
+| SSH and firewall changes can lock you out | One wrong line in `sshd_config` and the only remaining path is the provider console |
+| Batch operations multiply mistakes | One command on one host is a change; on fifty hosts it is an incident |
 
-## 安装
+Each safety rule is implemented as a **mechanism in the scripts**, not as prose the model is asked
+to remember:
 
-把整个目录放到 Claude Code 的 skills 目录即可：
+- Dangerous commands — recursive deletes, filesystem creation, firewall flushes, disk-level writes,
+  `sshd_config` edits, SIGKILL on PID 1, benchmark suites — are **refused** unless
+  `--confirm-danger` is supplied explicitly.
+- Every remote command is appended to an audit log, so "who changed what, when" has an answer.
+- A first-contact profile records hardware, services, and disk baselines once, so later work reads
+  cache instead of re-reconnoitering a production host.
+- Batch runs print the exact target list and require an explicit confirmation flag above ten
+  mutating targets.
+
+Password authentication works **without `sshpass`**, through OpenSSH's own `SSH_ASKPASS`
+mechanism, because a one-off login should not require generating a key pair first.
+
+## Features
+
+| | Capability | What it does |
+|---|---|---|
+| 🔐 | Password login, no `sshpass` | Credentials reach `ssh` through a private askpass helper — never argv, `ps`, shell history, or the audit log |
+| 🧭 | Risk tiering | Read-only / mutating / dangerous; tier 2 requires `--confirm-danger`, tier 1 warns with blast radius |
+| 📝 | Audit log | `timestamp \| host \| tier \| exit code \| duration \| command`, written by the wrapper itself |
+| 🗂 | Server profiles | One-time collection of slow-moving facts; identity verified by `machine_id` and host-key fingerprint |
+| 🩺 | One-shot inspection | Structured health report ending in a machine-readable `SSHMGR_VERDICT=OK\|WARN\|CRIT` |
+| 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; `--selftest` validates the local environment |
+| 🚫 | Benchmark refusal | `sysbench`/`fio`/`stress-ng`/`iperf3` are tier 2 by default — load tests on production corrupt metrics and can OOM a host |
+| 🧯 | Config-change protocol | Backup → syntax check → rollback timer → verify in a second session |
+| 🖥 | Batch execution | Tag-based selection, bounded concurrency, per-host logs, explicit failure list |
+| 🌐 | Zero remote load for latency | TCP handshake probing runs locally and detects transparent proxies that would falsify the numbers |
+
+## Requirements
+
+**Local machine**
+
+- `ssh`, `scp`, and `bash` 4.0 or newer
+- Optional: `rsync` (many small files), `python3` with PyYAML (multi-host inventory parsing only)
+
+**Target hosts**
+
+- Linux with systemd — Ubuntu/Debian, RHEL/CentOS/Rocky/Alma
+- `bash` on the remote side; scripts are piped in as `ssh host bash -s`
+
+**Windows**
+
+Run inside **Git-Bash**, not PowerShell with the native OpenSSH client. The native `ssh.exe`
+cannot execute shebang scripts, so the askpass helper fails and password login breaks.
+`scripts/ssh_exec.sh --selftest` detects and reports this case.
+
+## Installation
+
+The skill is a directory. Clone it into your Claude Code skills path:
 
 ```bash
 # macOS / Linux
@@ -47,81 +90,204 @@ git clone https://github.com/youbilin/ssh-server-manager.git ~/.claude/skills/ss
 git clone https://github.com/youbilin/ssh-server-manager.git "$USERPROFILE/.claude/skills/ssh-server-manager"
 ```
 
-也可以用软链接或直接复制，关键是让 `SKILL.md` 位于该目录根部。
+`SKILL.md` must sit at the root of that directory. A symlink works equally well if you prefer to
+keep the working copy elsewhere.
 
-## 依赖
-
-- **必须**：`ssh`、`scp`、`bash 4+`
-- **可选**：`rsync`（大量小文件传输更快）、`python3` + PyYAML（只用于解析多机 inventory）
-- 目标机需为 Linux（Ubuntu/Debian/CentOS/Rocky/Alma）
-- Windows 上请在 **Git-Bash** 里跑，不要用 `C:\Windows\System32\OpenSSH\ssh.exe`（它无法执行 shebang 脚本，密码登录会失败）；`ssh_exec.sh --selftest` 会明确指出
-
-## 快速开始
+## Quick start
 
 ```bash
-# 1) 自检本机环境
+# 1. Validate the local environment: ssh flavour, askpass support, timeout, multiplexing
 scripts/ssh_exec.sh --selftest
 
-# 2) 首次连一台机器（密码登录，口令不进 history）
+# 2. Connect with a password — the prompt never enters shell history
 scripts/ssh_exec.sh -H 203.0.113.10 -u root --prompt-credential -c 'uptime'
 
-# 3) 首次接触：采集服务器画像并存档（tcping + 只读采集 + 入库）
-scripts/profile_store.sh collect -H 203.0.113.10 -u root --prompt-credential --note "prod web"
+# 3. First contact: probe latency, collect a read-only profile, store it
+scripts/profile_store.sh collect -H 203.0.113.10 -u root \
+  --prompt-credential --note "prod web frontend"
 
-# 4) 之后查档案，不联网
+# 4. Later: read the cached profile, no network traffic
 scripts/profile_store.sh show -H 203.0.113.10 --short
 
-# 5) 当前状态巡检
+# 5. Current state rather than static facts
 scripts/ssh_exec.sh -H 203.0.113.10 -f scripts/health_check.sh -t 180
 
-# 6) 批量执行前先干跑
-scripts/batch_run.sh --inventory assets/inventory.example.yaml --tags web --cmd 'uptime' --dry-run
+# 6. Preview a batch before running it
+scripts/batch_run.sh --inventory assets/inventory.example.yaml --tags web \
+  --cmd 'uptime' --dry-run
 ```
 
-## 脚本一览
+## Script reference
 
-| 脚本 | 作用 |
+All scripts support `--help`.
+
+### `ssh_exec.sh` — remote execution wrapper
+
+Preflight, timeout, risk classification, audit logging, and error diagnosis in one entry point.
+
+```bash
+ssh_exec.sh -H web1 -c 'df -h'                          # read-only
+ssh_exec.sh -H web1 --preflight                         # connectivity only
+ssh_exec.sh -H web1 -f scripts/health_check.sh -t 180   # run a local script remotely
+ssh_exec.sh -H web1 --dry-run -c 'rm -rf /tmp/x'        # show the tier, execute nothing
+```
+
+Key options: `-u/--user`, `-p/--port`, `-J/--jump`, `-i/--identity`, `-t/--timeout`,
+`--preflight`, `--confirm-danger`, `--accept-host-key --fingerprint SHA256:…`, `--dry-run`,
+`--no-log`, `-q/--quiet`.
+
+Authentication: `--auth auto|key|password`, `--prompt-credential`, `--password-env VAR`,
+`--credential-file FILE`, `--save-credential`.
+
+Exit codes: `0` success · `124` timeout · `4` dangerous command not confirmed · `1` usage or local
+error · `2` connection or authentication failure · any other value is passed through from the
+remote command.
+
+### `health_check.sh` — one-shot inspection
+
+Runs **on the target host**. Read-only throughout, and deliberately without `set -e` so a missing
+tool degrades to "unavailable" instead of truncating the report.
+
+```bash
+ssh_exec.sh -H web1 -f scripts/health_check.sh -t 180
+ssh_exec.sh -H web1 -f scripts/health_check.sh -A '--sections cpu,memory,disk' -t 120
+ssh_exec.sh -H web1 -f scripts/health_check.sh -A '--deep --updates' -t 300
+```
+
+Sections: `identity`, `cpu`, `memory`, `disk`, `network`, `services`, `security`, `logins`,
+`docker`, `updates`.
+
+Flags: `--quick` (skip slow collection), `--deep` (directory scans), `--updates` (pending package
+counts), `--strict` (exit `1` on WARN, `2` on CRIT).
+
+Thresholds are environment-tunable: `SSHMGR_DISK_WARN`, `SSHMGR_DISK_CRIT`, `SSHMGR_INODE_WARN`,
+`SSHMGR_INODE_CRIT`, `SSHMGR_LOAD_WARN`, `SSHMGR_LOAD_CRIT`, `SSHMGR_MEM_WARN`,
+`SSHMGR_MEM_CRIT`.
+
+### `batch_run.sh` — multi-host execution
+
+```bash
+batch_run.sh --hosts 'web1 web2' --cmd 'df -h' --parallel 2
+batch_run.sh --hosts-file hosts.txt --cmd 'systemctl is-active nginx'
+batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime' --dry-run
+batch_run.sh --from-ssh-config 'web*' --cmd 'uptime'
+```
+
+Every host executes through `ssh_exec.sh`, so tiering and audit logging apply unchanged. Output is
+grouped per host; failing hosts are listed separately and always dumped in full. Mutating runs need
+`--yes` above ten targets; `--parallel 1 --stop-on-error` is the recommended first run.
+
+### `backup_config.sh` — pre-change backup
+
+```bash
+backup_config.sh -H web1 -f /etc/nginx/nginx.conf
+backup_config.sh -H web1 -d /etc/nginx/sites-enabled --sudo
+backup_config.sh -H web1 -f /etc/nginx/nginx.conf --list
+```
+
+Copies with a UTC timestamp, verifies the SHA-256 against the source, and prints a ready-to-run
+restore command followed by the matching syntax check and reload.
+
+### `profile_store.sh` — server profiles
+
+```bash
+profile_store.sh collect -H web1 --sections docker,services   # partial refresh
+profile_store.sh find | show | list | check | set | mark-stale | forget
+```
+
+Profiles are flat `key=value` files under `~/.ssh-server-manager/profiles/`. A collection with
+`--sections` is a **partial** refresh — unnamed sections are carried over untouched. Omitting
+`--sections` replaces the whole fact set.
+
+### `server_profile.sh` — remote collector
+
+Runs on the target host and is normally invoked through `profile_store.sh`. Read-only; the
+`# sshmgr:read-only` marker in its header is what exempts it from the mutating tier.
+
+### `tcping.sh` — local latency probe
+
+```bash
+tcping.sh -H 203.0.113.10 -p 22 -n 4
+```
+
+Performs TCP handshakes locally and produces no remote load. A control probe against
+`192.0.2.1:9` (TEST-NET-1, guaranteed unreachable) detects transparent proxies; if that probe
+succeeds, results are labelled `reliable=0` rather than presented as authoritative.
+
+## How the safety model works
+
+**Risk tiers.** Commands are classified by pattern before execution.
+
+| Tier | Examples | Behaviour |
+|---|---|---|
+| 0 — read-only | `df`, `systemctl status`, `journalctl`, `ss`, `docker ps` | Runs directly |
+| 1 — mutating | `systemctl restart`, package installs, `chmod`, `sed -i`, `docker compose up` | Warns with blast radius; affected profile sections are marked stale automatically |
+| 2 — dangerous | `rm -rf`, `mkfs`, `dd`, `iptables -F`, `ufw disable`, `sshd_config` edits, `DROP DATABASE`, benchmark suites | Refused unless `--confirm-danger` is passed |
+
+**Host keys.** Verification stays strict. First contact uses
+`--accept-host-key --fingerprint SHA256:…`; a scanned fingerprint that does not match the supplied
+value is rejected, and an existing `known_hosts` entry with a different key is never overwritten
+silently.
+
+**Config changes.** Backup → syntax check (`nginx -t`, `sshd -t`, `visudo -c`, `findmnt --verify`)
+→ arm an automatic rollback timer → verify in a second session while keeping the first one open.
+
+**Profiles.** Identity is `machine_id` plus the host-key fingerprint actually verified by the
+client, not the IP — addresses are recycled and NAT blurs them. A mismatch writes a separate
+`.m2.profile` and warns instead of overwriting.
+
+## Security model
+
+- **Credentials are not persisted by default.** Only `--save-credential` writes
+  `~/.ssh-server-manager/credentials`. Storing nothing is the protection; file modes are not.
+- **`sshpass -p` is never used** — it exposes the password in `ps` output.
+- **`chmod 600` is often a no-op under Git-Bash.** Mounts there carry `noacl`, so permission bits do
+  not move and Windows ACLs are untouched. The scripts report the measured mode instead of
+  printing a reassuring `0600`.
+- **Profiles, audit logs, and credentials contain infrastructure detail** — IPs, hostnames, image
+  lists. They live in `~/.ssh-server-manager/`, excluded from this repository by `.gitignore`.
+  Do not commit or paste them.
+- **Profile files are never `source`d or `eval`ed.** Values originate on the remote host, so a
+  malicious container name would otherwise be local code execution.
+
+## Documentation
+
+| Document | Contents |
 |---|---|
-| `scripts/ssh_exec.sh` | 远程执行封装：预检、超时、风险分级、审计、错误诊断 |
-| `scripts/health_check.sh` | 远端一键巡检（只读），输出结构化报告与结论行 |
-| `scripts/batch_run.sh` | 多机执行与汇总（tag 过滤、并发、失败清单） |
-| `scripts/backup_config.sh` | 改配置前备份 + 校验 + 打印可执行的还原命令 |
-| `scripts/profile_store.sh` | 服务器档案的采集/查询/标脏/重采 |
-| `scripts/server_profile.sh` | 远端只读采集器（通常由 profile_store 调用） |
-| `scripts/tcping.sh` | 本地 TCP 握手延迟探测，远端零负载 |
+| [`SKILL.md`](SKILL.md) | The skill definition and operating rules Claude Code loads |
+| [`references/troubleshooting.md`](references/troubleshooting.md) | Symptom-indexed handbook: connectivity, disk and inode exhaustion, service failures, 502/504, high load, OOM, port conflicts, certificate expiry, container restart loops |
+| [`references/common-commands.md`](references/common-commands.md) | Command reference grouped by scenario |
+| [`references/hardening.md`](references/hardening.md) | Hardening checklist ordered by risk, with lockout warnings |
+| [`references/server-baseline.md`](references/server-baseline.md) | Profile fields, reading rules, and refresh semantics |
+| [`assets/inventory.example.yaml`](assets/inventory.example.yaml) | Multi-host inventory template with tags and jump-host examples |
 
-每个脚本都支持 `--help`。
+## Repository layout
 
-## 参考文档
+```
+.
+├── SKILL.md                      # skill definition loaded by Claude Code
+├── README.md
+├── LICENSE
+├── scripts/
+│   ├── ssh_exec.sh               # execution wrapper (tiering, audit, diagnosis)
+│   ├── health_check.sh           # remote inspection
+│   ├── batch_run.sh              # multi-host runner
+│   ├── backup_config.sh          # pre-change backup and restore command
+│   ├── profile_store.sh          # local profile store
+│   ├── server_profile.sh         # remote profile collector
+│   └── tcping.sh                 # local TCP latency probe
+├── references/                   # on-demand knowledge documents
+├── assets/                       # inventory template
+└── evals/                        # skill evaluation fixtures
+```
 
-- [`references/troubleshooting.md`](references/troubleshooting.md) —— 按症状组织的故障排查手册（连不上、磁盘/Inode 满、服务起不来、502/504、高负载、OOM、端口占用、证书过期、容器重启循环）
-- [`references/common-commands.md`](references/common-commands.md) —— 按场景分组的命令速查
-- [`references/hardening.md`](references/hardening.md) —— 安全加固清单，带风险排序与锁死警告
-- [`references/server-baseline.md`](references/server-baseline.md) —— 服务器档案的字段、阅读方式、刷新规则
-- [`assets/inventory.example.yaml`](assets/inventory.example.yaml) —— 多机 inventory 模板
+## Contributing
 
-## 安全说明
+Issues and pull requests are welcome. The scripts target `bash` 4 and must keep working on macOS,
+Linux, and Git-Bash on Windows. Run `bash -n` over `scripts/*.sh` and
+`scripts/ssh_exec.sh --selftest` before submitting. Please preserve the `# sshmgr:read-only` header
+marker on read-only collectors — the wrapper relies on it for tiering.
 
-- **默认不落盘口令**。只有显式 `--save-credential` 才会写 `~/.ssh-server-manager/credentials`。
-- 主机密钥默认严格校验（`StrictHostKeyChecking=yes`）；首次连接用 `--accept-host-key --fingerprint SHA256:...`，
-  只有扫描到的指纹与人工核对过的值一致才写入。
-- `~/.ssh-server-manager/`（档案、审计日志、凭据、连接复用 socket）**不要提交到仓库或贴到公开场合**，
-  已包含在 `.gitignore` 中。
-- **不要用 `sshpass -p`**：口令会出现在 `ps` 输出里。
-- Git-Bash 的磁盘挂载通常是 `noacl`，`chmod 600` 对权限位是空操作，真正的边界是 Windows 账户 ACL。
-  「默认不持久化口令」才是实际的保护。
+## License
 
-## English
-
-`ssh-server-manager` is a Claude Code skill for operating remote Linux hosts over SSH.
-It supports password login out of the box (via ssh's own `SSH_ASKPASS`, no sshpass needed),
-classifies every command into read-only / mutating / dangerous tiers, refuses dangerous
-commands unless `--confirm-danger` is passed, audit-logs every remote command, caches a
-per-host profile collected on first contact, and ships a troubleshooting handbook.
-Stress-test and benchmark tools are classified as dangerous and refused by default.
-
-Requires `ssh`, `scp`, `bash 4+`; `rsync` and `python3` are optional.
-
-## 许可
-
-未指定许可证。如需复用，请先联系仓库所有者。
+Released under the [MIT License](LICENSE). Copyright © 2026 You Bilin.
