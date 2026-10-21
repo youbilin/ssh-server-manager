@@ -18,6 +18,15 @@ assert_contains "SSHMGR_TCPING=127.0.0.1:1" "$out" "result line"
 assert_contains "clock=" "$out" "clock should be reported"
 assert_contains "loss=1/1" "$out" "one probe should be lost"
 
+CURRENT_TEST="watchdog fallback"
+start="$(date +%s)"
+out="$(SSHMGR_NO_TIMEOUT=1 bash "$TCP" -H 127.0.0.1 -p 1 -n 1 -q 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+assert_rc 2 "$rc" "fallback rc"
+assert_contains "SSHMGR_TCPING" "$out" "fallback result line"
+assert_eq "1" "$([ "$elapsed" -le 15 ] && echo 1 || echo 0)" "fallback must not hang (took ${elapsed}s)"
+
 CURRENT_TEST="port validation"
 out="$(bash "$TCP" -H 127.0.0.1 -p 0 -n 1 -q 2>&1)"
 rc=$?

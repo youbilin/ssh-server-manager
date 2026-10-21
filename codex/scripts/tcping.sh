@@ -92,6 +92,7 @@ if command -v timeout >/dev/null 2>&1 && timeout --version >/dev/null 2>&1; then
 elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 fi
+[ "${SSHMGR_NO_TIMEOUT:-0}" = "1" ] && TIMEOUT_BIN=""
 
 # ---------- 时钟选择 ----------
 # EPOCHREALTIME 只有 bash 5 有；GNU date 支持 %N，BSD/macOS 的 date 不支持。
@@ -149,9 +150,23 @@ done
 probe() { # host port count gap deadline clock -> "OK ms" / "FAIL 0" 每行
   if [ -n "$TIMEOUT_BIN" ]; then
     "$TIMEOUT_BIN" "$5" bash -c "$INNER" _ "$1" "$2" "$3" "$4" "$6" 2>/dev/null
-  else
-    bash -c "$INNER" _ "$1" "$2" "$3" "$4" "$6" 2>/dev/null
+    return $?
   fi
+  # 没有 GNU timeout 时，/dev/tcp 对不可达地址可能一直等到内核超时（几十秒）。
+  # 这里给整批探测加一个看门狗，避免 selftest / profile collect 被卡住。
+  local pid wd
+  bash -c "$INNER" _ "$1" "$2" "$3" "$4" "$6" 2>/dev/null &
+  pid=$!
+  ( sleep "$5" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  return "$rc"
 }
 
 # ---------- 对照探测：本机是否在透明代理所有 TCP ----------

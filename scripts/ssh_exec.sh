@@ -181,6 +181,7 @@ usage() {
                           用于排查"口令为什么没发出去"
   SSHMGR_NO_MUX=1         关闭连接复用（默认开 ControlMaster，10 分钟内只认证一次）
   SSHMGR_AUDIT_MAX_BYTES  审计日志超过该字节数时轮转为 audit.log.1（默认关闭）
+  SSHMGR_NO_TIMEOUT=1     强制使用内置 bash 看门狗（测试/诊断用）
 USAGE
 }
 
@@ -446,6 +447,8 @@ if command -v timeout >/dev/null 2>&1 && timeout --version >/dev/null 2>&1; then
 elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 fi
+# 测试/诊断用：强制走内置看门狗
+[ "${SSHMGR_NO_TIMEOUT:-0}" = "1" ] && TIMEOUT_BIN=""
 
 # 没有 GNU timeout（例如默认 macOS）时的兜底看门狗。返回 124 与 timeout(1) 一致。
 run_limited() { # <seconds> <command...>
@@ -460,11 +463,11 @@ run_limited() { # <seconds> <command...>
   pid=$!
   (
     sleep "$secs" 2>/dev/null || true
-    : > "$marker" 2>/dev/null
+    printf 'timeout\n' > "$marker" 2>/dev/null
     kill -TERM "$pid" 2>/dev/null || true
     sleep 2 2>/dev/null || true
     kill -KILL "$pid" 2>/dev/null || true
-  ) &
+  ) >/dev/null 2>&1 &
   wd=$!
   WATCHDOG_PID="$wd"
   wait "$pid" 2>/dev/null

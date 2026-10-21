@@ -147,7 +147,17 @@ assert_rc 0 "$rc" "saved credential execution: $out"
 assert_not_contains "saved-secret" "$(cat "$FAKE_SSH_LOG")" "password must not appear in argv"
 assert_eq "0" "$(find "$TMPDIR" -maxdepth 1 -name 'sshmgr-*' 2>/dev/null | wc -l | tr -d ' ')" "no temp files after execution"
 
-# 8. Audit log keeps one parseable line and escapes pipes.
+# 8. Without GNU timeout, the built-in watchdog still bounds execution time.
+CURRENT_TEST="watchdog fallback"
+start="$(date +%s)"
+out="$(SSHMGR_NO_TIMEOUT=1 bash "$SSH_EXEC" -H slow-host --auth key --no-preflight -t 1 -c 'true' 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+assert_rc 124 "$rc" "watchdog timeout rc: $out"
+assert_contains "执行超时" "$out" "timeout message"
+assert_eq "1" "$([ "$elapsed" -le 4 ] && echo 1 || echo 0)" "watchdog should stop within a few seconds (took ${elapsed}s)"
+
+# 9. Audit log keeps one parseable line and escapes pipes.
 CURRENT_TEST="audit log escaping"
 : > "$FAKE_SSH_LOG"
 out="$(sv -H example.invalid --auth key --no-preflight -c 'echo a|b')"
@@ -157,7 +167,7 @@ line="$(tail -1 "$SSHMGR_HOME/audit.log" 2>/dev/null)"
 assert_contains "tier0" "$line" "audit line tier"
 assert_contains 'echo a\|b' "$line" "audit line must escape pipes"
 
-# 9. Usage guards.
+# 10. Usage guards.
 CURRENT_TEST="usage guards"
 out="$(sv --fingerprint 'SHA256:x' -H h -c true)"
 assert_contains "只能配合" "$out" "fingerprint without accept/show should be rejected"

@@ -29,4 +29,8 @@ fi
 if [ -n "${FAKE_SSH_OUTPUT:-}" ] && [ -f "$FAKE_SSH_OUTPUT" ]; then
   cat "$FAKE_SSH_OUTPUT"
 fi
+
+case " $* " in
+  *"slow-host"*) sleep 5 ;;
+esac
 exit "${FAKE_SSH_RC:-0}"
