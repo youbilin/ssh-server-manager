@@ -209,8 +209,9 @@ file_digest() {
   fi
 }
 
-LIST_KEYS=" docker_container docker_compose_project disk_dev fs_mount diskstat
-            net_iface addr listen unit_running unit_failed timer user_shell "
+# 必须是单行：awk -v 的赋值里出现换行会让 onetrue-awk（macOS /usr/bin/awk）
+# 直接报 "newline in string"，normalize_kv 就静默输出空。
+LIST_KEYS=" docker_container docker_compose_project disk_dev fs_mount diskstat net_iface addr listen unit_running unit_failed timer user_shell "
 REPEAT_KEYS=" ip_all alias "
 is_list_key() { case "$LIST_KEYS" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 

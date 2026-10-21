@@ -39,6 +39,20 @@ jobs:
       - name: shellcheck
         run: shellcheck -S warning scripts/*.sh scripts/lib/*.sh tests/*.sh tools/*.sh
 
+  bsd-awk:
+    name: BSD awk compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install onetrue-awk
+        run: sudo apt-get update && sudo apt-get install -y original-awk
+      - name: Profile tests with macOS-compatible awk
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/awkbin"
+          ln -sf "$(command -v original-awk)" "$RUNNER_TEMP/awkbin/awk"
+          PATH="$RUNNER_TEMP/awkbin:$PATH" bash tests/test_profile_store.sh
+
   codex-sync:
     name: codex build is in sync
     runs-on: ubuntu-latest
