@@ -454,6 +454,10 @@ awk '$9==502 {print $7}' /var/log/nginx/access.log | sort | uniq -c | sort -rn |
 scp -P 2222 ./app.tar.gz deploy@web1:/tmp/
 rsync -avz --progress --partial -e 'ssh -p 2222' ./dist/ deploy@web1:/srv/app/dist/
 rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run before deleting remotely
+
+# Download: same tools, swap source and destination
+scp -P 2222 deploy@web1:/var/log/app.log ./
+rsync -avz --partial -e 'ssh -p 2222' deploy@web1:/srv/app/logs/ ./logs/
 ```
 
 - Use `rsync` rather than `scp` for many small files; add `--partial` for resumability.
