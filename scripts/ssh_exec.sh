@@ -459,8 +459,12 @@ run_limited() { # <seconds> <command...>
   fi
   local marker pid wd rc
   marker="$(mktemp "${TMPDIR:-/tmp}/sshmgr-wd.XXXXXX" 2>/dev/null)" || { "$@"; return $?; }
-  "$@" &
+  # 后台任务在非交互 shell 中会把 stdin 接到 /dev/null；脚本模式（-f）正是把
+  # 远端脚本从 stdin 送进去的，必须先保存并显式恢复 fd 0，否则脚本会变成空文件。
+  exec 9<&0
+  "$@" <&9 &
   pid=$!
+  exec 9<&-
   (
     sleep "$secs" 2>/dev/null || true
     printf 'timeout\n' > "$marker" 2>/dev/null
