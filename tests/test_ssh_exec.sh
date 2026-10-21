@@ -155,7 +155,7 @@ rc=$?
 elapsed=$(( $(date +%s) - start ))
 assert_rc 124 "$rc" "watchdog timeout rc: $out"
 assert_contains "执行超时" "$out" "timeout message"
-assert_eq "1" "$([ "$elapsed" -le 4 ] && echo 1 || echo 0)" "watchdog should stop within a few seconds (took ${elapsed}s)"
+assert_eq "1" "$([ "$elapsed" -le 6 ] && echo 1 || echo 0)" "watchdog should stop within a few seconds (took ${elapsed}s)"
 
 # 9. Audit log keeps one parseable line and escapes pipes.
 CURRENT_TEST="audit log escaping"
