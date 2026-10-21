@@ -15,15 +15,17 @@
 #   bash health_check.sh --updates       # 额外统计待安装的更新数（apt/dnf，慢）
 #   bash health_check.sh --sections cpu,memory,disk
 #   bash health_check.sh --strict        # 有 WARN/CRIT 时以非零码退出（供批量脚本判定）
+#   bash health_check.sh --disk-warn 75 --disk-crit 85 --load-warn 1.5
 #
 # 通过 ssh_exec.sh 调用:
 #   ./ssh_exec.sh -H web1 -f ./health_check.sh -t 180
+#   ./ssh_exec.sh -H web1 -f ./health_check.sh -A "--disk-warn 75" -t 180
 #
-# 阈值可用环境变量覆盖（默认值按通用服务器设定，日志盘/构建机应各自调整）:
-#   SSHMGR_DISK_WARN=80    SSHMGR_DISK_CRIT=90
-#   SSHMGR_INODE_WARN=80   SSHMGR_INODE_CRIT=90
-#   SSHMGR_LOAD_WARN=1.0   SSHMGR_LOAD_CRIT=2.0    # 每核负载
-#   SSHMGR_MEM_WARN=85     SSHMGR_MEM_CRIT=93      # 已用内存百分比
+# 阈值可用命令行参数或环境变量覆盖（默认值按通用服务器设定，日志盘/构建机应各自调整）:
+#   --disk-warn / --disk-crit       SSHMGR_DISK_WARN=80    SSHMGR_DISK_CRIT=90
+#   --inode-warn / --inode-crit     SSHMGR_INODE_WARN=80   SSHMGR_INODE_CRIT=90
+#   --load-warn / --load-crit       SSHMGR_LOAD_WARN=1.0   SSHMGR_LOAD_CRIT=2.0    # 每核负载
+#   --mem-warn / --mem-crit         SSHMGR_MEM_WARN=85     SSHMGR_MEM_CRIT=93      # 已用内存百分比
 
 LC_ALL=C
 
@@ -32,6 +34,10 @@ QUICK=0
 DO_UPDATES=0
 STRICT=0
 WANT_SECTIONS=""
+CLI_DISK_WARN="" CLI_DISK_CRIT=""
+CLI_INODE_WARN="" CLI_INODE_CRIT=""
+CLI_LOAD_WARN="" CLI_LOAD_CRIT=""
+CLI_MEM_WARN="" CLI_MEM_CRIT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,23 +45,62 @@ while [ $# -gt 0 ]; do
     --quick)    QUICK=1; shift ;;
     --updates)  DO_UPDATES=1; shift ;;
     --strict)   STRICT=1; shift ;;
-    --sections) shift; WANT_SECTIONS="${1:-}"; shift ;;
-    -h|--help)  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --sections)
+      [ $# -ge 2 ] || { printf '[error] --sections 需要一个参数\n' >&2; exit 1; }
+      WANT_SECTIONS="$2"; shift 2 ;;
+    --disk-warn)  [ $# -ge 2 ] || exit 1; CLI_DISK_WARN="$2"; shift 2 ;;
+    --disk-crit)  [ $# -ge 2 ] || exit 1; CLI_DISK_CRIT="$2"; shift 2 ;;
+    --inode-warn) [ $# -ge 2 ] || exit 1; CLI_INODE_WARN="$2"; shift 2 ;;
+    --inode-crit) [ $# -ge 2 ] || exit 1; CLI_INODE_CRIT="$2"; shift 2 ;;
+    --load-warn)  [ $# -ge 2 ] || exit 1; CLI_LOAD_WARN="$2"; shift 2 ;;
+    --load-crit)  [ $# -ge 2 ] || exit 1; CLI_LOAD_CRIT="$2"; shift 2 ;;
+    --mem-warn)   [ $# -ge 2 ] || exit 1; CLI_MEM_WARN="$2"; shift 2 ;;
+    --mem-crit)   [ $# -ge 2 ] || exit 1; CLI_MEM_CRIT="$2"; shift 2 ;;
+    -h|--help)  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)          printf '未知选项: %s (--help)\n' "$1" >&2; exit 1 ;;
   esac
 done
 
+# ---------- 段落校验 ----------
+KNOWN_SECTIONS="identity cpu memory disk network services security logins docker updates"
+if [ -n "$WANT_SECTIONS" ]; then
+  _ifs="$IFS"; IFS=','
+  for _s in $WANT_SECTIONS; do
+    [ -n "$_s" ] || continue
+    case " $KNOWN_SECTIONS " in
+      *" $_s "*) ;;
+      *) printf '[error] 未知段落: %s（可用: %s）\n' "$_s" "$KNOWN_SECTIONS" >&2; exit 1 ;;
+    esac
+  done
+  IFS="$_ifs"
+fi
+
 # ---------- 阈值 ----------
-# 可按环境调整：日志盘、构建机、数据库对"满"和"忙"的定义本来就不同，
+# 可按命令行或环境调整：日志盘、构建机、数据库对"满"和"忙"的定义本来就不同，
 # 硬编码一套阈值会逼着使用者去改脚本。
-DISK_WARN="${SSHMGR_DISK_WARN:-80}"
-DISK_CRIT="${SSHMGR_DISK_CRIT:-90}"
-INODE_WARN="${SSHMGR_INODE_WARN:-80}"
-INODE_CRIT="${SSHMGR_INODE_CRIT:-90}"
-LOAD_WARN="${SSHMGR_LOAD_WARN:-1.0}"
-LOAD_CRIT="${SSHMGR_LOAD_CRIT:-2.0}"
-MEM_WARN="${SSHMGR_MEM_WARN:-85}"
-MEM_CRIT="${SSHMGR_MEM_CRIT:-93}"
+DISK_WARN="${CLI_DISK_WARN:-${SSHMGR_DISK_WARN:-80}}"
+DISK_CRIT="${CLI_DISK_CRIT:-${SSHMGR_DISK_CRIT:-90}}"
+INODE_WARN="${CLI_INODE_WARN:-${SSHMGR_INODE_WARN:-80}}"
+INODE_CRIT="${CLI_INODE_CRIT:-${SSHMGR_INODE_CRIT:-90}}"
+LOAD_WARN="${CLI_LOAD_WARN:-${SSHMGR_LOAD_WARN:-1.0}}"
+LOAD_CRIT="${CLI_LOAD_CRIT:-${SSHMGR_LOAD_CRIT:-2.0}}"
+MEM_WARN="${CLI_MEM_WARN:-${SSHMGR_MEM_WARN:-85}}"
+MEM_CRIT="${CLI_MEM_CRIT:-${SSHMGR_MEM_CRIT:-93}}"
+
+_validate_num() { # name value
+  case "$2" in
+    ''|*[!0-9.]*|*.*.*) printf '[error] 阈值 %s 不是数字: %s\n' "$1" "$2" >&2; exit 1 ;;
+  esac
+}
+_validate_num DISK_WARN "$DISK_WARN"
+_validate_num DISK_CRIT "$DISK_CRIT"
+_validate_num INODE_WARN "$INODE_WARN"
+_validate_num INODE_CRIT "$INODE_CRIT"
+_validate_num LOAD_WARN "$LOAD_WARN"
+_validate_num LOAD_CRIT "$LOAD_CRIT"
+_validate_num MEM_WARN "$MEM_WARN"
+_validate_num MEM_CRIT "$MEM_CRIT"
+unset _s _ifs
 
 # ---------- 基础 helpers ----------
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -429,6 +474,10 @@ fi
 fi
 
 # ---------- 9. Docker（可选） ----------
+if want docker && [ "$QUICK" -eq 1 ]; then
+  SEC "DOCKER / 容器"
+  NOTE "（--quick 已跳过 Docker 检查）"
+fi
 if want docker && [ "$QUICK" -eq 0 ]; then
 SEC "DOCKER / 容器"
 if have docker; then
@@ -436,11 +485,17 @@ if have docker; then
     running=$(docker ps -q 2>/dev/null | wc -l)
     total=$(docker ps -aq 2>/dev/null | wc -l)
     KV "容器" "${running} running / ${total} total"
-    NOTE "非 running 状态或 unhealthy 的容器:"
-    bad=$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep -viE 'up .*\(healthy\)|^$' | head -10)
+    NOTE "Exited / Restarting / unhealthy 的容器:"
+    # 没有 healthcheck 的 "Up 2 hours" 是正常状态，不能当成不健康 —— 以前的
+    # 负向 grep 会把所有未配置 healthcheck 的容器都报成异常。
+    bad=$(docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | awk -F'\t' '
+      {
+        s=tolower($2)
+        if (s ~ /^(exited|dead|restarting|removing|created|paused)/ || s ~ /\(unhealthy\)/) print $0
+      }' | head -10)
     if [ -n "$bad" ]; then
       printf '%s\n' "$bad" | sed 's/^/    /'
-      flag WARN "存在非健康状态的容器"
+      flag WARN "存在 Exited/Restarting/unhealthy 容器"
     else
       NOTE "    （无）"
     fi

@@ -316,7 +316,7 @@ if have systemctl; then
     | while read -r u; do L "unit_running" "$u"; done
 
   RUN 8 systemctl --failed --no-legend --no-pager 2>/dev/null | head -20 \
-    | while read -r u load act sub desc; do
+    | while read -r u _ act sub _; do
         [ -n "$u" ] && L "unit_failed" "${u}|${act:-?}/${sub:-?}"
       done
 
@@ -367,8 +367,8 @@ fw_done=0
 if [ "$IS_ROOT" = "1" ] && have ufw; then
   st="$(RUN 5 ufw status 2>/dev/null | head -1)"
   case "$st" in
-    *active*)   K "firewall" "ufw=active rules=$(RUN 5 ufw status numbered 2>/dev/null | grep -c '\[')"; fw_done=1 ;;
     *inactive*) K "firewall" "ufw=inactive"; fw_done=1 ;;
+    *active*)   K "firewall" "ufw=active rules=$(RUN 5 ufw status numbered 2>/dev/null | grep -c '\[')"; fw_done=1 ;;
   esac
 elif [ "$IS_ROOT" = "1" ] && have firewall-cmd; then
   if RUN 5 firewall-cmd --state >/dev/null 2>&1; then

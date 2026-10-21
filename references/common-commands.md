@@ -416,7 +416,7 @@ umask 027
 
 ⚠ `usermod -G group user` (without `-a`) **replaces** the user's supplementary groups with that single one, which can incidentally strip away sudo access. Always write `-aG`.
 ⚠ Editing `/etc/sudoers` directly and getting a single character wrong can cost you sudo permanently. Use `visudo` only; adding a new file under `sudoers.d` is lower risk, and verify afterwards with `visudo -c`.
-⚠ Back up `/etc/passwd` and `/etc/group` before changing them (`scripts/backup_config.sh`). If either file is corrupted, you will no longer be able to log in.
+⚠ Back up `/etc/passwd` and `/etc/group` before changing them (`$SKILL_DIR/scripts/backup_config.sh`). If either file is corrupted, you will no longer be able to log in.
 
 ---
 

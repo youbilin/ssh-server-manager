@@ -61,7 +61,7 @@ ssh -vvv -o ConnectTimeout=8 <host> true 2>&1 | tail -40
 
 ### Authentication Problems
 
-Check in this order, starting from the most common cause. Run `scripts/ssh_exec.sh --selftest` first —
+Check in this order, starting from the most common cause. Run `$SKILL_DIR/scripts/ssh_exec.sh --selftest` first —
 it answers most of the environment questions in one screen (which ssh binary, whether it supports
 `SSH_ASKPASS_REQUIRE`, whether the askpass helper works end to end).
 
@@ -103,7 +103,7 @@ sshd -T | grep -iE '^passwordauthentication|^kbdinteractiveauthentication|^permi
 ssh -vvv <host> true 2>&1 | grep -iE 'offering|authentications that can continue|MaxAuthTries'
 
 # 3) Did the password actually reach ssh? (logs the prompt text, never the password)
-SSHMGR_ASKPASS_DEBUG=1 scripts/ssh_exec.sh -H <host> --auth password --prompt-credential -c 'true'
+SSHMGR_ASKPASS_DEBUG=1 bash "$SKILL_DIR/scripts/ssh_exec.sh" -H <host> --auth password --prompt-credential -c 'true'
 cat ~/.ssh-server-manager/askpass.log
 ```
 
@@ -679,7 +679,7 @@ Try from the highest availability downward:
 
 ### Prevention (These Measures Exist for Exactly This Moment)
 
-- Back up before changing: `scripts/backup_config.sh -H web1 -f /etc/ssh/sshd_config --sudo`
+- Back up before changing: `$SKILL_DIR/scripts/backup_config.sh -H web1 -f /etc/ssh/sshd_config --sudo`
 - Attach an automatic rollback timer before changing:
 
   ```bash

@@ -94,7 +94,7 @@ UsePAM yes                            # keep this yes, or sudo and friends may s
 
 ```bash
 # backup + syntax check + rollback insurance
-bash $SKILL_DIR/scripts/backup_config.sh -H web1 -f /etc/ssh/sshd_config --sudo
+bash "$SKILL_DIR/scripts/backup_config.sh" -H web1 -f /etc/ssh/sshd_config --sudo
 sudo sshd -t
 sudo systemd-run --on-active=10min --unit=sshd-rollback \
   /bin/sh -c 'cp /etc/ssh/sshd_config.bak.<timestamp> /etc/ssh/sshd_config && systemctl reload sshd'

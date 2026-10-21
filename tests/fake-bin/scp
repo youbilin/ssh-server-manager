@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Offline stand-in for scp (used by backup_config tests if needed).
+set -uo pipefail
+[ -n "${FAKE_SCP_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_SCP_LOG"
+exit 0

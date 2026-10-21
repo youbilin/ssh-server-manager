@@ -103,7 +103,7 @@ sshd -T | grep -iE '^passwordauthentication|^kbdinteractiveauthentication|^permi
 ssh -vvv <host> true 2>&1 | grep -iE 'offering|authentications that can continue|MaxAuthTries'
 
 # 3) Did the password actually reach ssh? (logs the prompt text, never the password)
-SSHMGR_ASKPASS_DEBUG=1 bash $SKILL_DIR/scripts/ssh_exec.sh -H <host> --auth password --prompt-credential -c 'true'
+SSHMGR_ASKPASS_DEBUG=1 bash "$SKILL_DIR/scripts/ssh_exec.sh" -H <host> --auth password --prompt-credential -c 'true'
 cat ~/.ssh-server-manager/askpass.log
 ```
 

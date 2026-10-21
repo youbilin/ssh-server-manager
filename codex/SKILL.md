@@ -34,7 +34,9 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
 
 - **Passwords are not written to disk by default.** The user will say so if they want that;
   at that point add `--save-credential` to store it in `~/.ssh-server-manager/credentials`.
-  Don't store it if they didn't ask.
+  Later invocations reuse it explicitly with `--use-saved-credential` — it is never read
+  implicitly. Don't store it if they didn't ask.
+- **`--dry-run`, `--print-tier` and `--selftest` never read credentials and never connect.**
 - **Never use `sshpass -p`**: the password shows up in `ps` output. This script goes through
   ssh's own askpass; the password is handed to the helper via a private temp file that is
   deleted on exit. No sshpass needed.
@@ -57,17 +59,22 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
   fingerprint on first contact:
 
   ```bash
-  ssh-keyscan -t ed25519,rsa -p <port> <host> 2>/dev/null | ssh-keygen -lf -
+  # Print candidates without writing anything
+  bash $SKILL_DIR/scripts/ssh_exec.sh -H <host> --show-host-key
   # After checking against the cloud console or an admin, hand the confirmed value to the
   # script — only then will it write the key.
   bash $SKILL_DIR/scripts/ssh_exec.sh -H <host> --accept-host-key --fingerprint SHA256:xxxx
   ```
 
-  With `--fingerprint`, a scanned fingerprint that does not match is **refused** — verification
-  becomes a mechanism rather than a promise.
+  `--fingerprint` must be the complete `SHA256:...` value, must match a scanned key exactly, and
+  only that one key line is written. Partial values and mismatches are refused.
+  `--accept-host-key` works on its own (no `-c` needed). Aliases and non-22 ports are resolved
+  through `ssh -G`.
 - On `REMOTE HOST IDENTIFICATION HAS CHANGED`, suspect a reinstall or an IP change first; don't
   rush to delete the record. The script also refuses to overwrite an existing entry whose
   fingerprint differs, and points you at `ssh-keygen -R`.
+- A jump host is a separate trust decision: it must already be in `known_hosts` before
+  `--accept-host-key -J bastion` can scan the target through it.
 
 ### Command Risk Tiers
 
@@ -77,7 +84,12 @@ Assign a tier before running anything, and let the tier decide how you interact:
 |---|---|---|
 | **Read-only** | df, du, ps, top, cat, ls, tail, head, grep, journalctl, systemctl status, ss, netstat, ip, free, uptime, last, lsblk, docker ps | Run directly |
 | **Mutating** | systemctl start/stop/restart/reload/enable, apt·yum·dnf install/remove/upgrade, editing config files, chmod/chown, mv, sed -i, docker stop/rm/compose up·down, git pull deploys, ufw allow | State the blast radius and the rollback path first, then wait for confirmation |
-| **Dangerous** | rm -rf, dd, mkfs, fdisk/parted, truncate, chmod -R 777, chown -R on system directories, iptables -F, ufw disable / turning off the firewall, editing sshd_config, reboot/shutdown/halt, DROP·TRUNCATE DATABASE, kill -9 on system processes, overwriting files under /etc | Double confirmation required: show the user the exact command and ask once explicitly, and present the rollback plan up front |
+| **Dangerous** | rm -r, dd, mkfs, fdisk/parted, truncate, chmod -R 777, chown -R on system directories, iptables -F, ufw disable / turning off the firewall, editing sshd_config/fstab/sudoers, reboot/shutdown/halt, DROP·TRUNCATE DATABASE, kill -9 on system processes, overwriting files under /etc | Double confirmation required: show the user the exact command and ask once explicitly, and present the rollback plan up front |
+
+Classification is a guardrail, not a sandbox: it understands command position and common write
+targets, but cannot see inside `python -c`, assembled scripts, or arbitrary binaries.
+Read-only commands that merely mention a dangerous word — `cat /etc/ssh/sshd_config`,
+`journalctl | grep reboot`, `ps aux | grep fio` — stay at tier 0.
 
 **Prefer the reversible form.** This is not formalism: if `reload` fails you can revert to the
 old config; if `restart` fails the service is simply down.
@@ -121,11 +133,14 @@ firewall rules, `fstab`, `/etc/sudoers` — follow this order:
 
 Record every remote command you run to a local log, in the format
 `time | host | risk tier | exit code | duration | command`. Default location is
-`~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`.
+`~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`. Fields are escaped so the line
+stays parseable.
 
 `scripts/ssh_exec.sh` writes this automatically; add entries by hand when you execute some
-other way. Why it's worth keeping: the first question in any incident review is "who changed
-what, when" — and often this file is all that's left.
+other way. The log is append-only, not tamper-evident; ship it off-box if compliance requires
+that. Set `SSHMGR_AUDIT_MAX_BYTES` to rotate to `audit.log.1`. Why it's worth keeping: the first
+question in any incident review is "who changed what, when" — and often this file is all that's
+left.
 
 ## Workflow: A Depth Ladder, Used On Demand
 
@@ -189,19 +204,28 @@ bash $SKILL_DIR/scripts/profile_store.sh find -H web1          # resolvable by a
 bash $SKILL_DIR/scripts/profile_store.sh show -H web1 --short  # the ≤20-line portrait (show this, not 200 raw lines)
 bash $SKILL_DIR/scripts/profile_store.sh list                   # every profile in one table, with latency
 bash $SKILL_DIR/scripts/profile_store.sh check -H web1          # one connection to test whether it rebooted
+bash $SKILL_DIR/scripts/profile_store.sh compare -H web1,web2   # local hardware/service comparison
 ```
 
-- Profiles live in `~/.ssh-server-manager/profiles/<target>.profile`, alongside `audit.log`.
-  They contain IPs, hostnames, image lists and other infrastructure detail — **do not commit
-  them to a repository or paste them somewhere public**.
-- The filename follows the connection target (IP or alias), but the machine's real IP, hostname
-  and alias are all recorded inside, so any of the three finds the same profile.
+`collect` and `check` accept the same password options as `ssh_exec.sh` (`--auth`,
+`--prompt-credential`, `--password-env`, `--credential-file`, `--use-saved-credential`,
+`--save-credential`) and reuse stored user/port/jump/identity metadata.
+
+- Profiles live in `~/.ssh-server-manager/profiles/<target>.profile`, with `_<port>` for
+  non-default SSH ports, alongside `audit.log`. They contain IPs, hostnames, image lists and
+  other infrastructure detail — **do not commit them to a repository or paste them somewhere
+  public**. The store uses `umask 077` (700/600 on POSIX filesystems).
+- The machine's real IP, hostname and alias are all recorded inside, so any of the three finds
+  the same profile. Lookups match complete lines (`web1` does not match `web10`); if a host has
+  profiles for multiple ports, pass `-p` instead of letting the script guess.
 - **IPs get recycled, and behind NAT several machines share one egress IP**, so identity is not
-  IP alone: collection compares `machine_id` and the host-key fingerprint, and refuses to
-  overwrite on a mismatch, saving a `.m2.profile` and warning instead.
+  IP alone. The host-key fingerprint from `known_hosts` is primary; `machine_id` corroborates.
+  If either changes, the new result is saved as `.m2.profile` and the command exits 3;
+  `--force` overrides after you have confirmed the change.
 - **Profiles hold slow-moving facts only** (model, inventory, disk baseline). Load, free memory,
   connection counts and similar fast-moving state stay in `health_check.sh` and out of the
   profile — otherwise the profile is stale every day, which is the same as not having one.
+- `set -H web1 --note "..."` updates the note; collector-maintained fields cannot be edited.
 
 ### Refresh Rules
 
@@ -220,12 +244,13 @@ The script does this **automatically** after a successful mutating command. To r
 
 ```bash
 # --sections is a partial refresh: unnamed sections are carried over untouched from the
-# existing profile. Omitting --sections replaces the whole fact set.
+# existing profile, and only the refreshed sections are cleared from stale_sections.
+# Omitting --sections replaces the whole fact set and clears all stale markers.
 bash $SKILL_DIR/scripts/profile_store.sh collect -H web1 --sections docker,services   # re-collect just these
 bash $SKILL_DIR/scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "swapped image"
 ```
 
-If the machine rebooted (`check` tells you), `runtime/services/storage` are invalid while
+If the machine rebooted (`check` tells you), `runtimes/services/storage` are invalid while
 `identity/hw` remain perfectly good — there is no reason to re-read the CPU model because of a
 reboot.
 
@@ -324,9 +349,17 @@ bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.s
 Coverage: OS and kernel version, uptime, CPU and load (normalized by core count), memory and
 swap, disk and inode usage (with threshold verdicts), listening ports and connection states,
 failed systemd units, SELinux/AppArmor, firewall state, effective SSH config, recent logins,
-Docker container health. It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs can grep
-directly; thresholds are adjustable per machine role via environment variables such as
-`SSHMGR_DISK_WARN`.
+Docker container health (only Exited/Restarting/unhealthy are flagged; a running container
+without a healthcheck is normal). It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs
+can grep directly. Pass thresholds through the wrapper:
+
+```bash
+bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.sh \
+  -A "--disk-warn 75 --disk-crit 85 --load-warn 1.5" -t 180
+```
+
+The equivalent `SSHMGR_DISK_WARN` etc. environment variables work when the script runs directly
+on the host; local environment variables are not forwarded by ssh.
 
 **Reading the numbers** (this trips people up more than the commands do):
 
@@ -395,8 +428,9 @@ rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run bef
 - Use `rsync` rather than `scp` for many small files; add `--partial` for resumability.
   `--delete` is a mutating operation — dry-run it first to see the list.
 - **Back up before changing any config file**:
-  `scripts/backup_config.sh -H <host> -f /etc/nginx/nginx.conf`. It collects by timestamp,
-  verifies hashes, and prints a restore command you can copy and run.
+  `bash $SKILL_DIR/scripts/backup_config.sh -H <host> -f /etc/nginx/nginx.conf`. It collects
+  by timestamp, verifies hashes, and prints a restore command with the ssh prefix attached
+  (so it runs from your local machine) plus the matching syntax check.
 - Record the current state before changing permissions (`ls -l`,
   `stat -c '%a %U:%G' <path>`), or you cannot restore it afterwards. `chmod -R` / `chown -R`
   on system directories is dangerous: symlinks get followed, and you can break the execute
@@ -475,10 +509,14 @@ bash $SKILL_DIR/scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y up
   succeeded".
 - **Validate a mutating batch on one host before opening it up to all of them.** Add
   `--stop-on-error` to surface "the very first host failed" quickly.
-- With more than 10 targets the script demands an explicit `--yes`, so the "confirm the target
-  list" step cannot be skipped.
+- Any mutating or dangerous batch requires an explicit `--yes`, so the "confirm the target list"
+  step cannot be skipped; dangerous commands also need `--confirm-danger`.
+- Inventory entries may set `auth: auto|key|password`; command-line `--auth` overrides it.
+- Each run writes to a unique output directory with per-host logs named by index, so aliases are
+  display labels rather than file paths.
 - `--parallel 1 --stop-on-error` is the steadier combination for a first mutating run: one host
-  at a time, stopping immediately on a problem.
+  at a time, stopping immediately on a problem. With higher concurrency, up to N already-started
+  hosts will finish after a failure is detected.
 - A per-host timeout is recorded as a failure rather than "unknown" — review those hosts in the
   report; don't count them as successes.
 
@@ -629,8 +667,8 @@ Reference documents live under `$SKILL_DIR/references/`; read them on demand, no
 | `$SKILL_DIR/scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -c 'df -h'` |
 | `$SKILL_DIR/scripts/health_check.sh` | One-shot inspection that runs on the remote host, structured output | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.sh -t 180` |
 | `$SKILL_DIR/scripts/batch_run.sh` | Run across many hosts and summarize (tag filtering, concurrency, failure summary) | `bash $SKILL_DIR/scripts/batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime'` |
-| `$SKILL_DIR/scripts/backup_config.sh` | Back up before a config change; prints a ready-to-run restore command | `bash $SKILL_DIR/scripts/backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |
-| `$SKILL_DIR/scripts/profile_store.sh` | Server profiles: collect/find/show/list/check/set/mark-stale/forget (local; use collect on first contact) | `bash $SKILL_DIR/scripts/profile_store.sh collect -H web1 -u root` |
+| `$SKILL_DIR/scripts/backup_config.sh` | Back up before a config change; prints a restore command with the ssh prefix attached | `bash $SKILL_DIR/scripts/backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |
+| `$SKILL_DIR/scripts/profile_store.sh` | Server profiles: collect/find/show/list/check/compare/set/mark-stale/forget (local; use collect on first contact) | `bash $SKILL_DIR/scripts/profile_store.sh collect -H web1 -u root` |
 | `$SKILL_DIR/scripts/server_profile.sh` | The read-only collector that runs remotely (normally invoked by profile_store) | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/server_profile.sh -t 120` |
 | `$SKILL_DIR/scripts/tcping.sh` | Local TCP handshake latency probe, zero remote load | `bash $SKILL_DIR/scripts/tcping.sh -H web1 -p 22 -n 4` |
 
@@ -645,10 +683,12 @@ The read-only scripts bundled with this skill (`health_check.sh`, `server_profil
 exemption applies only to scripts inside this skill's own `scripts/` directory — it cannot be
 used to launder an arbitrary local script.
 
-When you cannot connect or authentication fails, run `ssh_exec.sh --selftest` first. It prints
-the ssh path and version, whether that ssh supports `SSH_ASKPASS_REQUIRE`, whether `/dev/tcp`
-and GNU timeout are available, whether the askpass helper can round-trip a password end to end,
-and whether the machine has a transparent proxy (which corrupts latency measurement).
+When you cannot connect or authentication fails, run `ssh_exec.sh --selftest` first. It does
+not connect or read credentials. It prints the ssh path/version, whether that ssh supports
+`SSH_ASKPASS_REQUIRE`, whether `/dev/tcp` is available, whether GNU timeout or the built-in
+watchdog will be used, which helper tools are present, whether the askpass helper round-trips a
+password end to end, the `ssh -G` resolution of a supplied host, and whether the machine has a
+transparent proxy (which corrupts latency measurement).
 
 ## Reference Documents
 

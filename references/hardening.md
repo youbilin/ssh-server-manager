@@ -94,7 +94,7 @@ UsePAM yes                            # keep this yes, or sudo and friends may s
 
 ```bash
 # backup + syntax check + rollback insurance
-scripts/backup_config.sh -H web1 -f /etc/ssh/sshd_config --sudo
+bash "$SKILL_DIR/scripts/backup_config.sh" -H web1 -f /etc/ssh/sshd_config --sudo
 sudo sshd -t
 sudo systemd-run --on-active=10min --unit=sshd-rollback \
   /bin/sh -c 'cp /etc/ssh/sshd_config.bak.<timestamp> /etc/ssh/sshd_config && systemctl reload sshd'
@@ -460,7 +460,7 @@ sudo chmod 600 /etc/crontab /etc/sudoers
 ```
 
 ⚠ `chmod -R` / `chown -R` follow symlinks, and applied to `/etc` or `/usr` they can directly break sudo/ssh. Record the state with `getfacl -R` first, and prefer targeting specific files rather than a whole tree.
-⚠ Back up before changing `/etc/passwd`, `/etc/group`, `/etc/shadow`: `scripts/backup_config.sh`.
+⚠ Back up before changing `/etc/passwd`, `/etc/group`, `/etc/shadow`: `$SKILL_DIR/scripts/backup_config.sh`.
 
 ### 🔴 High Risk: Things Not to Do
 

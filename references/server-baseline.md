@@ -16,7 +16,7 @@ So the division is explicit:
 |---|---|---|
 | Content | Hardware model, kernel, virtualization, disks and filesystems, NICs and listening ports, Docker and container inventory, systemd service inventory, runtime versions, firewall and effective sshd config, accounts | Load, memory/swap headroom, current connection counts, failed units, container health, disk usage |
 | Rate of change | Months to years | Seconds to minutes |
-| Owned by | `scripts/server_profile.sh` + `profile_store.sh` | `scripts/health_check.sh` |
+| Owned by | `$SKILL_DIR/scripts/server_profile.sh` + `profile_store.sh` | `$SKILL_DIR/scripts/health_check.sh` |
 
 ## Location and Format
 
@@ -28,14 +28,20 @@ So the division is explicit:
 └── profiles/
     ├── 203.0.113.10.profile        # named after the connection target
     ├── 203.0.113.10_2222.profile   # non-22 port
-    └── web1.m2.profile             # a different machine at the same target (machine_id mismatch)
+    └── web1.m2.profile             # a different machine at the same target (identity mismatch)
 ```
 
 The format is flat `key=value`, `#` for comments, and it is hand-editable. List keys are indexed
 as `key.0` / `key.1` when read; `ip_all` and `alias` are exceptions — they stay as plain repeated
-lines because `find` matches them with fixed-string grep.
+lines because `find` matches them with fixed-string grep. Lookups match complete lines, not
+prefixes: `find -H web1` does not match `web10`.
 
-Override the directory with `SSHMGR_HOME` (or `SSHMGR_LOG_DIR`).
+Override the directory with `SSHMGR_HOME` (or `SSHMGR_LOG_DIR`). The store is created with
+`umask 077`: directories are 700 and files 600 on filesystems that implement POSIX modes.
+Remember that Git-Bash mounts often do not, so file modes are not a security boundary there.
+
+When a host has profiles for more than one port, commands that need to connect or show one
+profile require `-p <port>` rather than picking one silently.
 
 **⚠ Profiles contain infrastructure detail — IPs, hostnames, image lists. Do not commit them to
 a repository or paste them somewhere public.**
@@ -53,6 +59,9 @@ a repository or paste them somewhere public.**
 | `runtimes` | python3/node/php/java/go/ruby/nginx/mysqld/redis/psql versions |
 | `security` | firewall state, effective sshd config, accounts with a login shell |
 
+`list` shows the stored average latency; `compare -H a,b` renders the slow-moving fields side by
+side without a network call.
+
 ## ⛔ Prohibited Collection Methods (Hard Rule of This Skill)
 
 **Never run benchmarks or stress tests.** Prohibited: `sysbench`, `fio`, `dd` write tests,
@@ -69,7 +78,7 @@ Three reasons:
    headroom, not a benchmark score.
 
 One look at TCP handshake latency is all the connectivity measurement needed (initiated locally,
-zero remote load): `scripts/tcping.sh -H <host> -p 22`.
+zero remote load): `$SKILL_DIR/scripts/tcping.sh -H <host> -p 22`.
 
 These commands are classified as dangerous and `ssh_exec.sh` **refuses them by default** — the
 rule is implemented as a mechanism.
@@ -93,8 +102,8 @@ These are not fastidiousness; each one corresponds to a real trap:
 - **Check `command -v` before probing a language runtime**: `java -version` starts a JVM
   (~0.2–1s), and spawning a process for a runtime that doesn't exist is not worth it.
 - **`docker ps` often fails on socket permissions for a non-root user** → record
-  `docker=present,inaccessible`. That is a completely different meaning from `docker=absent`,
-  and is handled differently.
+  `docker=present` plus `docker_accessible=no`. That is a completely different meaning from
+  `docker=absent`, and is handled differently.
 
 ## The Completeness Sentinel
 
@@ -107,8 +116,8 @@ Without this gate, one slow query silently poisons the cache — and the entire 
 design is that the cache is trustworthy. Better to report "collection failed" than to hand back
 a profile that looks complete but is missing half its contents.
 
-`schema_version` / `collector_sha256` also provide the basis for automatic re-collection after
-the collector itself changes.
+`profile_schema` and `collector_sha256` are recorded so you can tell when the collector
+itself changed. Nothing re-collects automatically; use the recorded hash to decide.
 
 ## Identity: Why IP Alone Is Not Enough
 
@@ -118,15 +127,18 @@ different ports on the same IP can be entirely different machines or accounts. T
 - **The primary criterion is the host-key fingerprint** — read the record the client **actually
   verified**, from `known_hosts` via `ssh-keygen -F`, rather than re-running `ssh-keyscan`:
   keyscan is unauthenticated and can be MITM'd independently of the real key. Note that entries
-  for non-22 ports take the form `[host]:port`.
+  for non-22 ports take the form `[host]:port`. The lookup uses the effective hostname/port
+  from `ssh -G`, so aliases and custom ports work.
 - **`machine_id` is corroboration only.** It is absent on Alpine/OpenRC, **identical** across
   clones of a golden image, and overwritten by `/run/machine-id` inside containers so that it
   **changes on every boot**.
-- On a `machine_id` mismatch the script **refuses to overwrite**, saving a
-  `<target>.m2.profile` and warning instead. Once you have confirmed it really was a reinstall
-  or a different machine, delete the old profile with `forget` or overwrite with `--force`.
-- A changed host-key fingerprint raises a warning — it could be a reinstall, or it could be a
-  man in the middle. Either way it is worth stopping to look.
+- If either the fingerprint or `machine_id` changes, the script **refuses to overwrite**,
+  saving a `<target>.m2.profile` and exiting 3 instead. Once you have confirmed it really was
+  a reinstall or a different machine, delete the old profile with `forget` or overwrite with
+  `--force`.
+- A changed host-key fingerprint is treated as an identity change, not just a warning — it
+  could be a reinstall, or it could be a man in the middle. Either way it is worth stopping to
+  look.
 
 ## Freshness: Free Reboot Detection
 
@@ -134,7 +146,7 @@ Profiles store `boot_id` and `uptime_s`. Reading `/proc/sys/kernel/random/boot_i
 connect tells you whether the machine has rebooted since collection:
 
 ```bash
-scripts/profile_store.sh check -H web1
+$SKILL_DIR/scripts/profile_store.sh check -H web1
 ```
 
 - **No reboot** → the profile baseline (including the cumulative `/proc/diskstats` counters) is
@@ -164,15 +176,22 @@ After a successful mutating command `ssh_exec.sh` marks sections stale **automat
 according to this table; it does not depend on anyone remembering. By hand:
 
 ```bash
-scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "swapped image"
-scripts/profile_store.sh collect  -H web1 --sections docker,services   # re-collect just these
+$SKILL_DIR/scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "swapped image"
+$SKILL_DIR/scripts/profile_store.sh collect  -H web1 --sections docker,services   # re-collect just these
 ```
 
 `identity` and `hw` essentially never go stale, unless the machine is replaced.
 
 `collect --sections a,b` is a **partial** refresh: the sections you did not name are carried
-over from the existing profile unchanged, and only the named ones are rewritten. Run `collect`
-with no `--sections` for a full refresh, which replaces the whole fact set.
+over from the existing profile unchanged, and only the named ones are rewritten. Stale markers
+for sections that were refreshed are cleared; stale markers for other sections remain. Run
+`collect` with no `--sections` for a full refresh, which replaces the whole fact set and clears
+all stale markers.
+
+`collect` and `check` reuse the stored `ssh_user`/`ssh_port`/`ssh_jump`/`ssh_identity` from an
+existing profile, so `-p 2222 -J bastion` does not need to be repeated on every refresh. They
+also accept `--auth`, `--prompt-credential`, `--password-env`, `--credential-file`,
+`--use-saved-credential`, and `--save-credential`.
 
 ## Security: An Honest Account
 
@@ -203,23 +222,24 @@ with no `--sections` for a full refresh, which replaces the whole fact set.
 
 ```bash
 # First contact
-scripts/profile_store.sh collect -H 203.0.113.10 -u root --prompt-credential --note "prod web frontend"
+$SKILL_DIR/scripts/profile_store.sh collect -H 203.0.113.10 -u root --prompt-credential --note "prod web frontend"
 
 # Query the profile (local, no network)
-scripts/profile_store.sh find -H web1
-scripts/profile_store.sh show -H web1 --short
-scripts/profile_store.sh show -H web1 --fields os,cpu_model,docker_container
-scripts/profile_store.sh list
+$SKILL_DIR/scripts/profile_store.sh find -H web1
+$SKILL_DIR/scripts/profile_store.sh show -H web1 --short
+$SKILL_DIR/scripts/profile_store.sh show -H web1 --fields os,cpu_model,docker_container
+$SKILL_DIR/scripts/profile_store.sh list
+$SKILL_DIR/scripts/profile_store.sh compare -H web1,web2
 
-# Freshness
-scripts/profile_store.sh check -H web1
+# Freshness; add -p <port> when the host has profiles for more than one port
+$SKILL_DIR/scripts/profile_store.sh check -H web1
 
 # Maintenance
-scripts/profile_store.sh set -H web1 --note "prod DB, hands off"
-scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "..."
-scripts/profile_store.sh forget -H web1
+$SKILL_DIR/scripts/profile_store.sh set -H web1 --note "prod DB, hands off"
+$SKILL_DIR/scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "..."
+$SKILL_DIR/scripts/profile_store.sh forget -H web1
 
 # Collect only some sections / see collector options
-scripts/profile_store.sh collect -H web1 --sections identity,hw
-scripts/ssh_exec.sh -H web1 -f scripts/server_profile.sh -A "--sections docker" -t 60
+$SKILL_DIR/scripts/profile_store.sh collect -H web1 --sections identity,hw
+$SKILL_DIR/scripts/ssh_exec.sh -H web1 -f "$SKILL_DIR/scripts/server_profile.sh" -A "--sections docker" -t 60
 ```

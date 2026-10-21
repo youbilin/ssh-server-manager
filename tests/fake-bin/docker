@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Minimal docker stand-in for health_check tests.
+set -uo pipefail
+
+case "${1:-}" in
+  info)
+    exit 0 ;;
+  ps)
+    case " $* " in
+      *" -q "*) echo "container-id" ;;
+      *" -aq "*) printf 'a\nb\nc\n' ;;
+      *"--format"*)
+        printf 'web\tUp 2 hours\n'
+        printf 'api\tUp 3 hours (healthy)\n'
+        printf 'job\tExited (1) 5 minutes ago\n'
+        ;;
+      *) printf 'web\napi\njob\n' ;;
+    esac
+    ;;
+  system)
+    printf 'TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n'
+    ;;
+  *) exit 0 ;;
+esac
+exit 0

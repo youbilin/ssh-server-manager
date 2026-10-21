@@ -8,6 +8,9 @@ audit.log
 askpass.log
 credentials
 
+# Local agent settings
+.claude/settings.local.json
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db

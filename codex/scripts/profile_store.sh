@@ -5,6 +5,7 @@
 # 每次都重新侦察一遍是浪费，而且采集完就丢等于白采。档案让"第一次看清、之后查档"成立。
 #
 # 存放位置: ${SSHMGR_HOME:-~/.ssh-server-manager}/profiles/<目标>.profile
+#           非默认端口: <目标>_<port>.profile
 #           与 audit.log 同目录。档案里有 IP、主机名、镜像清单这类基础设施细节，
 #           不要把它提交到仓库或贴进公开场合。
 #
@@ -15,10 +16,9 @@
 #   一个恶意容器名就是本地代码执行。这里只用 IFS='=' 的 read 逐行解析并校验键名。
 #
 # 身份判定：IP 会被回收、NAT 下多机共用出口、同一 IP 不同端口可能是不同账号，
-#   所以"是不是上次那台机器"主要看主机密钥指纹（客户端实际验证过的那个，
-#   从 known_hosts 读），machine_id 只作旁证 —— 它在 Alpine 上不存在、
-#   在 golden image 克隆体上完全相同、在容器里每次启动都变。
-#   指纹对不上时拒绝覆盖，另存 <目标>.m2.profile 并告警。
+#   所以身份主要看主机密钥指纹（客户端实际验证过的那个，从 known_hosts 读），
+#   machine_id 只作旁证 —— 它在 Alpine 上不存在、在 golden image 克隆体上完全相同、
+#   在容器里每次启动都变。任一判据不一致都会拒绝覆盖，另存 <目标>.m2.profile 并告警。
 #
 # 用法:
 #   ./profile_store.sh collect -H 203.0.113.10 -u root -p 22   # 首次接触就这一步
@@ -26,27 +26,45 @@
 #   ./profile_store.sh show -H web1 [--fields os,cpu_model] [--short]
 #   ./profile_store.sh list                                    # 全部档案一张表
 #   ./profile_store.sh check -H web1                           # 1 次连接验证档案是否过期
+#   ./profile_store.sh compare -H web1,web2                    # 本地对比硬件/服务
 #   ./profile_store.sh set -H web1 note="生产库，别乱动"
 #   ./profile_store.sh mark-stale -H web1 --sections docker,services --reason "docker compose up"
 #   ./profile_store.sh forget -H web1
 #
-# 退出码: 0 成功 | 1 用法错误 | 2 目标不存在 | 3 采集失败/结果不完整
+# 退出码: 0 成功 | 1 用法错误 | 2 目标不存在/查找不唯一 | 3 采集失败/身份冲突
 
 set -uo pipefail
 LC_ALL=C
+# 档案含 IP、主机名、镜像清单等基础设施信息；默认子进程创建的文件都应是私有的。
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSH_EXEC="$SCRIPT_DIR/ssh_exec.sh"
 PROFILE_SH="$SCRIPT_DIR/server_profile.sh"
 TCPING="$SCRIPT_DIR/tcping.sh"
+if [ ! -r "$SCRIPT_DIR/lib/target.sh" ]; then
+  printf '[error] 安装不完整：缺少 scripts/lib/target.sh\n' >&2
+  exit 1
+fi
+# shellcheck source=lib/target.sh
+. "$SCRIPT_DIR/lib/target.sh"
 
 HOME_DIR="${SSHMGR_HOME:-${SSHMGR_LOG_DIR:-$HOME/.ssh-server-manager}}"
 PROFILE_DIR="$HOME_DIR/profiles"
 
 CMD=""
-TARGET="" SSH_USER="" SSH_PORT="" SSH_JUMP="" SSH_IDENTITY=""
+TARGET=""
+TARGETS=""
+SSH_USER="" SSH_PORT="" SSH_JUMP="" SSH_IDENTITY=""
+ALIAS_OPT=""
+AUTH_MODE=""
+PASSWORD_ENV=""
+CREDENTIAL_FILE=""
+PROMPT_CREDENTIAL=0
+SAVE_CREDENTIAL=0
+USE_SAVED_CREDENTIAL=0
 SECTIONS="identity,hw,storage,network,docker,services,runtimes,security"
-PARTIAL_COLLECT=0   # collect --sections 显式给了段落 → 只重采这些，其余保留
+PARTIAL_COLLECT=0
 NOTE=""
 STALE_SECTIONS="" STALE_REASON=""
 FIELDS="" SHORT=0
@@ -54,6 +72,8 @@ COLLECT_TIMEOUT=150
 SKIP_TCPING=0
 FORCE=0
 SET_PAIRS=""
+
+KNOWN_SECTIONS="identity hw storage network docker services runtimes security"
 
 if [ -t 1 ]; then C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
 else C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_OFF=""; fi
@@ -71,6 +91,7 @@ usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; cat <<'USAGE'
   show      输出档案内容（--fields 挑字段，--short 出紧凑画像）
   list      全部档案一张表
   check     用 1 次连接（只 cat boot_id）判断档案是否因重启而过期
+  compare   本地对比两台或多台档案（-H a,b 或重复 -H）
   set       更新档案字段: set -H web1 note="..." key=value ...
   mark-stale 把某些段落标脏（改了服务之后调用，档案才不会悄悄过时）
   hint      输出一行档案状态提示（给 ssh_exec.sh 用；新鲜时什么都不打印）
@@ -84,8 +105,18 @@ collect 选项:
   -i, --identity FILE    私钥路径
       --sections LIST    只采这些段落（默认全采）
       --note TEXT        写一句备注（如"生产库，别乱动"）
+      --alias NAME       设置别名（默认沿用旧值，IP 采集时不会覆盖人工别名）
       --skip-tcping      跳过延迟探测
       --timeout SEC      采集超时（默认 150）
+      --force            身份判据不一致时仍覆盖（谨慎）
+
+认证（collect/check 使用；与 ssh_exec.sh 相同）:
+      --auth MODE        auto | key | password
+      --password-env VAR
+      --credential-file F
+      --prompt-credential
+      --use-saved-credential
+      --save-credential
 
 mark-stale 选项:
       --sections LIST    哪些段落失效了（docker,services,storage...）
@@ -94,22 +125,25 @@ USAGE
 }
 
 # ---------- 参数 ----------
-# 先处理裸 --help/-h：它出现在子命令之前时不该被当成子命令名
 if [ $# -ge 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then usage; exit 0; fi
 [ $# -ge 1 ] || { usage; exit 1; }
 CMD="$1"; shift
 while [ $# -gt 0 ]; do
   case "$1" in
-    -H|--host)        [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; TARGET="$2"; shift 2 ;;
+    -H|--host)
+      [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }
+      TARGET="$2"; TARGETS="$TARGETS $2"; shift 2 ;;
     -u|--user)        [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; SSH_USER="$2"; shift 2 ;;
     -p|--port)        [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; SSH_PORT="$2"; shift 2 ;;
     -J|--jump)        [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; SSH_JUMP="$2"; shift 2 ;;
     -i|--identity)    [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; SSH_IDENTITY="$2"; shift 2 ;;
-    --sections)       [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }
-                      # 同一个选项在 collect 下是"只采这些段落"，
-                      # 在 mark-stale 下是"这些段落失效了" —— 按子命令决定含义
-                      if [ "$CMD" = "mark-stale" ]; then STALE_SECTIONS="$2"; else SECTIONS="$2"; PARTIAL_COLLECT=1; fi
-                      shift 2 ;;
+    --alias)          [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; ALIAS_OPT="$2"; shift 2 ;;
+    --sections)
+      [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }
+      # 同一个选项在 collect 下是"只采这些段落"，
+      # 在 mark-stale 下是"这些段落失效了" —— 按子命令决定含义
+      if [ "$CMD" = "mark-stale" ]; then STALE_SECTIONS="$2"; else SECTIONS="$2"; PARTIAL_COLLECT=1; fi
+      shift 2 ;;
     --note)           [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; NOTE="$2"; shift 2 ;;
     --reason)         [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; STALE_REASON="$2"; shift 2 ;;
     --fields)         [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; FIELDS="$2"; shift 2 ;;
@@ -117,6 +151,12 @@ while [ $# -gt 0 ]; do
     --skip-tcping)    SKIP_TCPING=1; shift ;;
     --timeout)        [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; COLLECT_TIMEOUT="$2"; shift 2 ;;
     --force)          FORCE=1; shift ;;
+    --auth)           [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; AUTH_MODE="$2"; shift 2 ;;
+    --password-env)   [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; PASSWORD_ENV="$2"; shift 2 ;;
+    --credential-file) [ $# -ge 2 ] || { err "$1 需要参数"; exit 1; }; CREDENTIAL_FILE="$2"; shift 2 ;;
+    --prompt-credential) PROMPT_CREDENTIAL=1; shift ;;
+    --save-credential) SAVE_CREDENTIAL=1; shift ;;
+    --use-saved-credential) USE_SAVED_CREDENTIAL=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     # set 子命令的 k=v 对（键名合法性在 do_set 里校验，这里先收下来）
     [A-Za-z_]*=*)     SET_PAIRS="$SET_PAIRS
@@ -124,19 +164,44 @@ $1"; shift ;;
     *)                err "未知参数: $1（--help 查看用法）"; exit 1 ;;
   esac
 done
-case "$CMD" in collect|find|show|check|set|mark-stale|forget|hint)
+
+case "$CMD" in collect|find|show|check|set|mark-stale|forget|hint|compare)
   [ -n "$TARGET" ] || { err "需要 -H 指定目标"; exit 1; } ;;
+  list) ;;
+  *) usage; exit 1 ;;
 esac
-case "$CMD" in list) ;; *) ;; esac
+
+NOTE="$(printf '%s' "$NOTE" | tr '\n\r\t' '   ')"
+ALIAS_OPT="$(printf '%s' "$ALIAS_OPT" | tr '\n\r\t' '   ')"
+STALE_REASON="$(printf '%s' "$STALE_REASON" | tr '\n\r\t' '   ')"
+case "$AUTH_MODE" in ''|auto|key|password) ;; *) err "--auth 只能是 auto|key|password"; exit 1 ;; esac
+case "$COLLECT_TIMEOUT" in ''|*[!0-9]*) err "--timeout 必须是整数秒"; exit 1 ;; esac
+[ "$COLLECT_TIMEOUT" -ge 1 ] || { err "--timeout 至少为 1"; exit 1; }
+if [ -n "$SSH_PORT" ]; then
+  case "$SSH_PORT" in ''|*[!0-9]*) err "端口必须是数字"; exit 1 ;; esac
+  [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ] || { err "端口必须在 1-65535 之间"; exit 1; }
+fi
+
+validate_sections() { # $1=逗号列表；未知段落直接拒绝
+  local list="$1" s
+  [ -n "$list" ] || { err "段落列表不能为空"; exit 1; }
+  local IFS=','
+  for s in $list; do
+    [ -n "$s" ] || continue
+    case " $KNOWN_SECTIONS " in
+      *" $s "*) ;;
+      *) err "未知段落: $s（可用: $KNOWN_SECTIONS）"; exit 1 ;;
+    esac
+  done
+}
+case "$CMD" in
+  collect) validate_sections "$SECTIONS" ;;
+  mark-stale) [ -n "$STALE_SECTIONS" ] && validate_sections "$STALE_SECTIONS" ;;
+esac
 
 # ---------- 工具 ----------
-# 文件名清洗：IPv6 的冒号在 NTFS 上是非法字符，其它路径特殊字符一并转下划线。
-# 用"白名单以外的字符全替换成 _"（tr -c）而不是逐一列举要替换的字符 ——
-# 枚举写法里末尾那个反斜杠会让 tr 打印可移植性警告，而且总容易漏掉字符。
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
-
 now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S'; }
-
 file_digest() {
   if   command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -c1-12
   elif command -v shasum >/dev/null 2>&1;    then shasum -a 256 "$1" 2>/dev/null | cut -c1-12
@@ -144,19 +209,11 @@ file_digest() {
   fi
 }
 
-# 已声明的列表键：解析时固定索引成 key.N；其余键视为标量，重复出现则告警取末值
 LIST_KEYS=" docker_container docker_compose_project disk_dev fs_mount diskstat
             net_iface addr listen unit_running unit_failed timer user_shell "
-# 直通键：可以重复出现但**不**索引。原因：find 用固定字符串 grep（grep -F）匹配它们，
-# 索引成 ip_all.0=... 会让查找失配。直通写法对人和 grep 都最友好。
 REPEAT_KEYS=" ip_all alias "
 is_list_key() { case "$LIST_KEYS" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-# ---------- 段落归属 ----------
-# 只重采某几个段落时（collect --sections docker），旧档案里**其余段落必须原样保留**。
-# 以前是整份重写：采一次 docker 就把 hw/identity/storage 全丢了，档案悄悄变残，
-# 而使用者以为它还是完整的。这里把"哪个键属于哪个段落"写死成一张表，
-# 用于合并时决定保留还是丢弃 —— 与 server_profile.sh 的 want 分支一一对应。
 KEY_SECTION_PATTERNS="
 identity:profile_schema collected_at collected_by hostname fqdn kernel arch virt os os_id os_version machine_id boot_id uptime_s boot_time ip_primary ip_all ip6_primary reboot_required selinux apparmor timezone ntp_synced ssh_unit
 hw:cpu_ mem_total_mb swap_total_mb gpu
@@ -168,9 +225,6 @@ runtimes:python3 node php java go ruby nginx mysqld redis postgres_client
 security:firewall ssh_ user_shell
 "
 
-# 显示列宽：中文标签是双宽字符，而 printf 的 %-Ns 按字节补空格、本脚本又是 LC_ALL=C
-# （bash 的 ${#s} 也只数字节），直接用 %-Ns 会让中文列错位。
-# ASCII 每字节 1 列，UTF-8 多字节字符（CJK）按 2 列，续字节跳过。
 dispwidth() {
   local s="$1" i b w=0
   for ((i=0; i<${#s}; i++)); do
@@ -183,11 +237,24 @@ dispwidth() {
   printf '%d' "$w"
 }
 
-profile_path() { printf '%s/%s.profile' "$PROFILE_DIR" "$(sanitize "$1")"; }
+profile_path() { # <host> [port]
+  local h p="$2"
+  h="$(sanitize "$1")"
+  if [ -n "$p" ] && [ "$p" != "22" ]; then
+    printf '%s/%s_%s.profile' "$PROFILE_DIR" "$h" "$p"
+  else
+    printf '%s/%s.profile' "$PROFILE_DIR" "$h"
+  fi
+}
+
+profile_paths_for() { # <host> -> 所有可能文件名
+  local h; h="$(sanitize "$1")"
+  [ -f "$PROFILE_DIR/$h.profile" ] && printf '%s\n' "$PROFILE_DIR/$h.profile"
+  local f
+  for f in "$PROFILE_DIR/$h"_*.profile; do [ -f "$f" ] && printf '%s\n' "$f"; done
+}
 
 # ---------- 解析 ----------
-# 把 key=value 流规范化：列表键索引化、剥掉行尾 CR（这些文件会被记事本/PowerShell 打开）、
-# 校验键名。绝不 eval —— 值是远端来的不可信字符串。
 normalize_kv() { # stdin -> stdout
   awk -F'=' -v LIST_KEYS="$LIST_KEYS" -v REPEAT_KEYS="$REPEAT_KEYS" '
     function ltrim(s){gsub(/^[ \t]+/,"",s);return s}
@@ -208,41 +275,97 @@ normalize_kv() { # stdin -> stdout
     }'
 }
 
-# 读档案里的标量值（含 key.N 形式的列表键首值）
-pget() { # pget <file> <key>
-  awk -F'=' -v want="$1" '
+pget() { # pget <file> <key> -> 首个非空值
+  awk -F'=' -v want="$2" '
     { sub(/\r$/,"") }
     /^[ \t]*#/ { next }
     {
       k=$1; if (k==want || index(k, want ".")==1) { v=substr($0, index($0,"=")+1); if (v!="") { print v; exit } }
-    }' "$2" 2>/dev/null
+    }' "$1" 2>/dev/null
 }
 
 # ---------- 查找 ----------
-# 档案名是"用户连接时用的目标"，但机器的真实 IP 也在档案里。
-# 所以按别名/主机名/IP 都能找到 —— 用 IP 连和用名字连应该命中同一份档案。
-find_profile() { # find_profile <target> -> 打印路径，找不到 exit 2
+# 精确匹配整行；不能用 grep -F 前缀，否则 find -H 203.0.113.1 会命中 .10。
+_find_by_content() { # <needle> [port] -> 打印路径
+  local needle="$1" port="${2:-}" f hits="" hit_count=0
+  local matches
+  matches="$(grep -lFx \
+      -e "alias=$needle" -e "hostname=$needle" -e "fqdn=$needle" \
+      -e "ip_primary=$needle" -e "ip_all=$needle" -e "connect_target=$needle" \
+      "$PROFILE_DIR"/*.profile 2>/dev/null | sort -u)"
+  for f in $matches; do
+    [ -f "$f" ] || continue
+    if [ -n "$port" ]; then
+      local fp; fp="$(pget "$f" ssh_port)"; [ -n "$fp" ] || fp=22
+      [ "$fp" = "$port" ] || continue
+    fi
+    hits="$hits $f"
+    hit_count=$((hit_count + 1))
+  done
+  [ "$hit_count" -gt 0 ] || return 2
+  if [ "$hit_count" -gt 1 ]; then
+    warn "多个档案匹配 $needle${port:+（端口 $port）}，请用 -p 或具体路径区分："
+    for f in $hits; do printf '    %s\n' "$f" >&2; done
+    return 3
+  fi
+  printf '%s\n' "$hits" | sed 's/^ *//'
+  return 0
+}
+
+# find_profile <target> [port] -> 打印路径；0 命中，2 未命中，3 不唯一
+find_profile() {
+  local target="$1" port="${2:-}" host t f
   [ -d "$PROFILE_DIR" ] || return 2
-  local t="$1" f hit
-  # 1) 精确文件名
-  f="$(profile_path "$t")"
-  [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
-  # 2) 去掉 user@ 前缀再试
-  t="${t##*@}"
-  f="$(profile_path "$t")"
-  [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
-  # 3) 扫内容：alias / hostname / ip_primary / ip_all / 精确目标记录
-  t="${1##*@}"
-  hit="$(grep -lF -e "alias=$t" -e "hostname=$t" -e "ip_primary=$t" -e "ip_all=$t" -e "connect_target=$t" \
-         "$PROFILE_DIR"/*.profile 2>/dev/null | head -1)"
-  [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  host="${target##*@}"
+
+  local variants=""
+  variants="$(profile_paths_for "$host")"
+
+  if [ -n "$port" ]; then
+    # 1) 精确文件名（含端口）
+    f="$(profile_path "$host" "$port")"
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    # 2) 同主机的端口变体里按档案记录的 ssh_port 过滤
+    if [ -n "$variants" ]; then
+      local n f2 matched=""
+      for f2 in $variants; do
+        local fp2; fp2="$(pget "$f2" ssh_port)"; [ -n "$fp2" ] || fp2=22
+        [ "$fp2" = "$port" ] && matched="$matched $f2"
+      done
+      n="$(printf '%s\n' "$matched" | grep -c . || true)"
+      if [ "$n" -eq 1 ]; then printf '%s\n' "$matched" | sed 's/^ *//'; return 0; fi
+    fi
+  else
+    # 未指定端口：只有一个档案才自动选；多个必须让用户用 -p 明确，
+    # 否则 show/check 可能悄悄读错端口上的另一台机器。
+    if [ -n "$variants" ]; then
+      local n; n="$(printf '%s\n' "$variants" | grep -c . || true)"
+      if [ "$n" -eq 1 ]; then printf '%s\n' "$variants"; return 0; fi
+      warn "目标 $host 有多个端口的档案，请用 -p 指定端口："
+      printf '%s\n' "$variants" | sed 's/^/    /' >&2
+      return 3
+    fi
+  fi
+
+  # 3) 内容精确匹配（alias/hostname/ip/connect_target）
+  t="${target##*@}"
+  _find_by_content "$t" "$port" && return 0
+  local rc=$?
+  [ "$rc" -eq 3 ] && return 3
+
+  # 4) ssh_config 别名：用 ssh -G 解析出真实 hostname 再查
+  if command -v "${SSHMGR_SSH:-ssh}" >/dev/null 2>&1; then
+    sshmgr_resolve_target "${SSHMGR_SSH:-ssh}" "$host" "" "$port" "" ""
+    if [ -n "$SSHMGR_TARGET_HOST" ] && [ "$SSHMGR_TARGET_HOST" != "$host" ]; then
+      _find_by_content "$SSHMGR_TARGET_HOST" "$port" && return 0
+      [ $? -eq 3 ] && return 3
+    fi
+  fi
   return 2
 }
 
-# key_section <key> -> 段落名；未收录的键输出空串（调用方按"其他段落"保留）
-# 直接遍历字符串，不开管道：管道里的 while 跑在子 shell，return 行为容易踩坑，
-# 而且每合并一个键 fork 一次太浪费。
-key_section() {
+# ---------- 段落归属 ----------
+key_section() { # <key> -> 段落名；未收录输出空串
   local k="$1" ent sec names n
   while IFS= read -r ent; do
     [ -n "$ent" ] || continue
@@ -259,32 +382,91 @@ EOF
   printf ''
 }
 
-# 合并旧档案：保留本次没重采的段落，丢弃本次重采段落里已不存在的旧键。
-# $1=旧档案文件  $2=本次采集的段落列表（逗号分隔）
-# 由调用方把它接到新结果**之前**写进临时文件；同名标量键在档案里后写者生效
-# （normalize_kv 取末值），所以旧值被新值的覆盖是天然成立的。
-merge_old_sections() {
-  local old="$1" wanted=",$2," k sec
+merge_old_sections() { # $1=旧档案 $2=本次采集的段落
+  local old="$1" wanted=",$2," k sec line
   [ -f "$old" ] || return 0
   while IFS= read -r line; do
     case "$line" in
-      ''|'#'*) continue ;;       # 注释与空行不搬
-      *=*) ;;                    # 只搬 key=value
+      ''|'#'*) continue ;;
+      *=*) ;;
       *) continue ;;
     esac
     case "$line" in
-      connect_target=*|ssh_user=*|ssh_port=*|ssh_jump=*|ssh_identity=*|first_seen=*|last_scan=*|scan_count=*|collector_sha256=*|latency_min_ms=*|latency_avg_ms=*|latency_reliable=*|host_key_fp=*|alias=*|note=*|stale_sections=*|stale_reason=*|stale_at=*|profile_updated=*)
-        continue ;;              # 元数据由本次采集重新生成
+      connect_target=*|ssh_user=*|ssh_port=*|ssh_jump=*|ssh_identity=*|first_seen=*|last_scan=*|scan_count=*|collector_sha256=*|latency_*|host_key_fp=*|alias=*|note=*|stale_sections=*|stale_reason=*|stale_at=*|profile_updated=*)
+        continue ;;
     esac
     k="${line%%=*}"
     sec="$(key_section "$k")"
     if [ -n "$sec" ]; then
       case "$wanted" in
-        *",$sec,"*) continue ;;  # 本次重采了这一段：旧值作废
+        *",$sec,"*) continue ;;
       esac
     fi
     printf '%s\n' "$line"
   done < "$old"
+}
+
+# ---------- 连接元数据 ----------
+# 取档案里保存的 user/port/jump/identity，再用 ssh -G 补齐 ssh_config 中的值。
+EFF_HOST="" EFF_PORT="22" EFF_USER="" EFF_JUMP="" EFF_IDENTITY=""
+EFF_KH_FILE="" EFF_KH_ENTRY=""
+resolve_connection_meta() { # $1=旧档案路径（可为空）
+  local pfile="${1:-}" hostpart="$TARGET"
+  case "$hostpart" in *@*) hostpart="${hostpart#*@}" ;; esac
+  local target_user=""
+  case "$TARGET" in *@*) target_user="${TARGET%%@*}" ;; esac
+
+  EFF_USER="${SSH_USER:-$target_user}"
+  EFF_PORT="$SSH_PORT"
+  EFF_JUMP="$SSH_JUMP"
+  EFF_IDENTITY="$SSH_IDENTITY"
+
+  if [ -n "$pfile" ] && [ -f "$pfile" ]; then
+    [ -z "$EFF_USER" ]     && EFF_USER="$(pget "$pfile" ssh_user)"
+    [ -z "$EFF_PORT" ]     && EFF_PORT="$(pget "$pfile" ssh_port)"
+    [ -z "$EFF_JUMP" ]     && EFF_JUMP="$(pget "$pfile" ssh_jump)"
+    [ -z "$EFF_IDENTITY" ] && EFF_IDENTITY="$(pget "$pfile" ssh_identity)"
+  fi
+
+  sshmgr_resolve_target "${SSHMGR_SSH:-ssh}" "$hostpart" "$EFF_USER" "$EFF_PORT" "$EFF_JUMP" "$EFF_IDENTITY"
+  EFF_HOST="$SSHMGR_TARGET_HOST"
+  EFF_PORT="$SSHMGR_TARGET_PORT"
+  EFF_USER="$SSHMGR_TARGET_USER"
+  EFF_JUMP="$SSHMGR_TARGET_JUMP"
+  EFF_IDENTITY="$SSHMGR_TARGET_IDENTITY"
+  EFF_KH_FILE="$SSHMGR_TARGET_KH_FILE"
+  EFF_KH_ENTRY="$SSHMGR_TARGET_KH_ENTRY"
+}
+
+# 读取客户端实际验证过的 known_hosts 指纹。
+target_fingerprint() {
+  [ -n "$EFF_KH_FILE" ] && [ -f "$EFF_KH_FILE" ] || return 0
+  command -v ssh-keygen >/dev/null 2>&1 || return 0
+  ssh-keygen -F "$EFF_KH_ENTRY" -f "$EFF_KH_FILE" 2>/dev/null \
+    | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | head -1 | awk '{print $2}'
+}
+
+RUN_ARGS=()
+build_run_args() {
+  RUN_ARGS=(-q -H "$TARGET")
+  [ -n "$EFF_USER" ]     && RUN_ARGS+=(-u "$EFF_USER")
+  [ -n "$EFF_PORT" ]     && RUN_ARGS+=(-p "$EFF_PORT")
+  [ -n "$EFF_JUMP" ]     && RUN_ARGS+=(-J "$EFF_JUMP")
+  [ -n "$EFF_IDENTITY" ] && RUN_ARGS+=(-i "$EFF_IDENTITY")
+  [ -n "$AUTH_MODE" ]    && RUN_ARGS+=(--auth "$AUTH_MODE")
+  [ -n "$PASSWORD_ENV" ] && RUN_ARGS+=(--password-env "$PASSWORD_ENV")
+  [ -n "$CREDENTIAL_FILE" ] && RUN_ARGS+=(--credential-file "$CREDENTIAL_FILE")
+  [ "$PROMPT_CREDENTIAL" -eq 1 ] && RUN_ARGS+=(--prompt-credential)
+  [ "$SAVE_CREDENTIAL" -eq 1 ] && RUN_ARGS+=(--save-credential)
+  [ "$USE_SAVED_CREDENTIAL" -eq 1 ] && RUN_ARGS+=(--use-saved-credential)
+}
+
+like_ip() {
+  case "$1" in
+    *[!0-9.]*) case "$1" in *:*) return 0 ;; *) return 1 ;; esac ;;
+    *.*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # ---------- collect ----------
@@ -292,50 +474,63 @@ do_collect() {
   [ -f "$SSH_EXEC" ]    || { err "找不到 $SSH_EXEC"; exit 1; }
   [ -f "$PROFILE_SH" ]  || { err "找不到 $PROFILE_SH"; exit 1; }
   mkdir -p "$PROFILE_DIR" 2>/dev/null || { err "无法创建 $PROFILE_DIR"; exit 1; }
+  chmod 700 "$HOME_DIR" "$PROFILE_DIR" 2>/dev/null || true
 
-  local host="${TARGET##*@}"
-  local pfile="$(profile_path "$host")"
+  local hostpart="${TARGET##*@}" pfile="" find_rc=0
+  pfile="$(find_profile "$TARGET" "$SSH_PORT")" || find_rc=$?
+  if [ "$find_rc" -eq 3 ]; then
+    err "目标有多个档案，无法确定要更新哪一份；请用 -p 指定端口或先 forget 旧档案。"
+    exit 2
+  fi
+  [ "$find_rc" -eq 0 ] || pfile=""
+
+  # 显式端口与旧档案端口不同：不是同一份档案，创建新文件。
+  if [ -n "$pfile" ] && [ -n "$SSH_PORT" ]; then
+    local old_port; old_port="$(pget "$pfile" ssh_port)"; [ -n "$old_port" ] || old_port=22
+    [ "$old_port" = "$SSH_PORT" ] || pfile=""
+  fi
+
+  resolve_connection_meta "$pfile"
+  [ -n "$EFF_PORT" ] || EFF_PORT=22
+  if [ -z "$pfile" ]; then
+    pfile="$(profile_path "$hostpart" "$EFF_PORT")"
+  fi
 
   # ---------- 1. 延迟探测（本地，零远端负载） ----------
   local latency_line=""
-  # port 必须在两个分支之前定义：经跳板机那条分支以前引用了只在前一个分支里
-  # 声明的局部变量，`set -u` 下直接 `port: unbound variable` 退出。
-  local port="${SSH_PORT:-22}"
-  if [ "$SKIP_TCPING" -eq 0 ] && [ -f "$TCPING" ] && [ -z "$SSH_JUMP" ]; then
-    latency_line="$(bash "$TCPING" -H "$host" -p "$port" -n 4 -q 2>/dev/null | head -1)"
+  if [ "$SKIP_TCPING" -eq 0 ] && [ -f "$TCPING" ] && [ -z "$EFF_JUMP" ]; then
+    latency_line="$(bash "$TCPING" -H "$EFF_HOST" -p "$EFF_PORT" -n 4 -q 2>/dev/null | head -1)"
     [ -n "$latency_line" ] && dim "  $latency_line"
-  elif [ -n "$SSH_JUMP" ]; then
-    # 经跳板机时本地 RTT 无意义，直接跳过
-    latency_line="SSHMGR_TCPING=$host:$port min=- avg=- max=- loss=-/- skip=jump"
+  elif [ -n "$EFF_JUMP" ]; then
+    latency_line="SSHMGR_TCPING=$EFF_HOST:$EFF_PORT min=- avg=- max=- loss=-/- skip=jump"
     dim "  经跳板机连接，跳过本地延迟探测（测了也不是到目标机的真实延迟）"
   fi
+  local lat_min lat_avg lat_rel lat_skip
   lat_min="$(printf '%s' "$latency_line" | sed -n 's/.*[[:space:]]min=\([^[:space:]]*\).*/\1/p')"
   lat_avg="$(printf '%s' "$latency_line" | sed -n 's/.*[[:space:]]avg=\([^[:space:]]*\).*/\1/p')"
   lat_rel="$(printf '%s' "$latency_line" | sed -n 's/.*[[:space:]]reliable=\([01]\).*/\1/p')"
   lat_skip="$(printf '%s' "$latency_line" | sed -n 's/.*[[:space:]]skip=\([a-z]*\).*/\1/p')"
-  # 对照探测发现本机有透明代理时，这个延迟就不是到服务器的延迟 —— 记下来，别当成网络 RTT 用
   [ "${lat_rel:-1}" = "0" ] && warn "本机存在透明代理，延迟数值不可信（详见 tcping.sh 头部说明）"
 
   # ---------- 2. 远端采集 ----------
   dim "  -> 在 $TARGET 上采集（只读，不跑任何压测）..."
-  local out rc
-  # 用数组拼参数，不要用 ${VAR:+...} 直接展开：那种写法没有引号包住，
-  # 值里一旦有空格就会被拆成两个参数（用户名或路径里出现空格并非不可能）。
-  local -a sshargs=(-q -H "$TARGET")
-  [ -n "$SSH_USER" ]     && sshargs+=(-u "$SSH_USER")
-  [ -n "$SSH_PORT" ]     && sshargs+=(-p "$SSH_PORT")
-  [ -n "$SSH_JUMP" ]     && sshargs+=(-J "$SSH_JUMP")
-  [ -n "$SSH_IDENTITY" ] && sshargs+=(-i "$SSH_IDENTITY")
-  sshargs+=(-f "$PROFILE_SH" -A "--sections $SECTIONS" -t "$COLLECT_TIMEOUT")
-  sshargs+=(--label "profile-collect $TARGET")
-  out="$(bash "$SSH_EXEC" "${sshargs[@]}" 2>/dev/null)"
+  build_run_args
+  RUN_ARGS+=(-f "$PROFILE_SH" -A "--sections $SECTIONS" -t "$COLLECT_TIMEOUT" --label "profile-collect $TARGET")
+  local errfile out rc
+  errfile="$(mktemp "${TMPDIR:-/tmp}/sshmgr-collect.XXXXXX" 2>/dev/null)" || errfile=""
+  out="$(bash "$SSH_EXEC" "${RUN_ARGS[@]}" 2>"${errfile:-/dev/null}")"
   rc=$?
+  local errout=""
+  [ -n "$errfile" ] && [ -f "$errfile" ] && errout="$(cat "$errfile" 2>/dev/null)"
+  [ -n "$errfile" ] && rm -f "$errfile"
+
   if [ "$rc" -ne 0 ]; then
     err "采集失败（ssh_exec.sh 退出码 $rc）。常见原因：连不上 / 认证失败 / 超时"
+    [ -n "$errout" ] && printf '%s\n' "$errout" | sed 's/^/  /' >&2
     # 半份结果绝不入库：见 server_profile.sh 尾部的完整性哨兵说明
-    if [ -n "$out" ]; then
+    if [ -n "$out" ] || [ -n "$errout" ]; then
       local pf="$pfile.partial"
-      printf '%s\n' "$out" > "$pf" 2>/dev/null || true
+      { [ -n "$errout" ] && printf '# stderr\n%s\n' "$errout"; printf '%s\n' "$out"; } > "$pf" 2>/dev/null || true
       warn "原始输出已存到 $pf 供排查，未写入档案"
     fi
     exit 3
@@ -351,40 +546,65 @@ do_collect() {
     exit 3
   fi
 
-  # ---------- 4. 与已有档案比对身份（是不是同一台机器） ----------
-  local old_machine old_fp
+  # ---------- 4. 与已有档案比对身份 ----------
+  local old_machine="" old_fp=""
   if [ -f "$pfile" ]; then
-    old_machine="$(pget machine_id "$pfile")"
-    old_fp="$(pget host_key_fp "$pfile")"
+    old_machine="$(pget "$pfile" machine_id)"
+    old_fp="$(pget "$pfile" host_key_fp)"
   fi
-
-  # 主机密钥指纹：用客户端实际验证过的那条记录（known_hosts），不是重新 keyscan
-  local kh_entry fp=""
-  if [ "${SSH_PORT:-22}" = "22" ]; then kh_entry="$host"; else kh_entry="[$host]:$SSH_PORT"; fi
-  for kh in "$HOME/.ssh/known_hosts"; do
-    [ -f "$kh" ] || continue
-    fp="$(ssh-keygen -F "$kh_entry" -f "$kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | head -1 | awk '{print $2}')"
-    [ -n "$fp" ] && break
-  done
+  local new_machine new_fp
+  new_machine="$(printf '%s\n' "$out" | sed -n 's/^machine_id=//p' | head -1)"
+  new_fp="$(target_fingerprint)"
 
   # ---------- 5. 组装档案（原子写入） ----------
   local tmp="$pfile.tmp.$$"
-  local scan_count=1 first_seen now
+  local scan_count=1 first_seen now old_note old_alias
   now="$(now_utc)"
   if [ -f "$pfile" ]; then
-    scan_count=$(( $(pget scan_count "$pfile" || echo 0) + 1 ))
-    first_seen="$(pget first_seen "$pfile")"
+    local old_count; old_count="$(pget "$pfile" scan_count)"
+    case "$old_count" in ''|*[!0-9]*) old_count=0 ;; esac
+    scan_count=$((old_count + 1))
+    first_seen="$(pget "$pfile" first_seen)"
+    old_note="$(pget "$pfile" note)"
+    old_alias="$(pget "$pfile" alias)"
   fi
   [ -n "${first_seen:-}" ] || first_seen="$now"
 
-  {
+  local write_alias=""
+  if [ -n "$ALIAS_OPT" ]; then
+    write_alias="$ALIAS_OPT"
+  elif ! like_ip "$hostpart"; then
+    write_alias="$hostpart"
+  elif [ -n "${old_alias:-}" ]; then
+    write_alias="$old_alias"
+  else
+    write_alias="$hostpart"
+  fi
+
+  local remain_stale="" old_stale=""
+  if [ "$PARTIAL_COLLECT" -eq 1 ] && [ -f "$pfile" ]; then
+    old_stale="$(pget "$pfile" stale_sections)"
+    local s
+    local IFS=','
+    for s in $old_stale; do
+      [ -n "$s" ] || continue
+      case ",$SECTIONS," in
+        *",$s,"*) ;;
+        *) remain_stale="${remain_stale}${remain_stale:+,}$s" ;;
+      esac
+    done
+    unset IFS
+  fi
+
+  (
+    umask 077
     printf '# ssh-server-manager profile —— 手工可编辑，保持 key=value 单行格式\n'
     printf '# 由 profile_store.sh collect 生成于 %s\n' "$now"
     printf 'connect_target=%s\n' "$TARGET"
-    printf 'ssh_user=%s\n' "${SSH_USER:-$(pget ssh_user "$pfile" 2>/dev/null || echo '')}"
-    printf 'ssh_port=%s\n' "${SSH_PORT:-$(pget ssh_port "$pfile" 2>/dev/null || echo 22)}"
-    [ -n "$SSH_JUMP" ] && printf 'ssh_jump=%s\n' "$SSH_JUMP"
-    [ -n "$SSH_IDENTITY" ] && printf 'ssh_identity=%s\n' "$SSH_IDENTITY"
+    printf 'ssh_user=%s\n' "$EFF_USER"
+    printf 'ssh_port=%s\n' "$EFF_PORT"
+    [ -n "$EFF_JUMP" ]     && printf 'ssh_jump=%s\n' "$EFF_JUMP"
+    [ -n "$EFF_IDENTITY" ] && printf 'ssh_identity=%s\n' "$EFF_IDENTITY"
     printf 'first_seen=%s\n' "$first_seen"
     printf 'last_scan=%s\n' "$now"
     printf 'scan_count=%s\n' "$scan_count"
@@ -396,72 +616,82 @@ do_collect() {
     else
       printf 'latency_reliable=%s\n' "${lat_rel:-1}"
     fi
-    [ -n "$fp" ] && printf 'host_key_fp=%s\n' "$fp"
-    printf 'alias=%s\n' "$TARGET"
-    [ -n "$NOTE" ] && printf 'note=%s\n' "$NOTE"
-    # 保留旧档案里的手工字段（note/alias），丢掉会被本次覆盖的事实字段
-    if [ -f "$pfile" ]; then
-      local old_note; old_note="$(pget note "$pfile")"
-      [ -n "$old_note" ] && [ -z "$NOTE" ] && printf 'note=%s\n' "$old_note"
+    [ -n "$new_fp" ] && printf 'host_key_fp=%s\n' "$new_fp"
+    printf 'alias=%s\n' "$write_alias"
+    if [ -n "$NOTE" ]; then
+      printf 'note=%s\n' "$NOTE"
+    elif [ -n "${old_note:-}" ]; then
+      printf 'note=%s\n' "$old_note"
     fi
-    # 部分重采（--sections）时，先把旧档案里"本次没采的段落"整段搬过来，
-    # 再接本次结果：档案才不会因为采了一个段落就悄悄丢掉其余事实。
-    # 全量采集时不合并 —— 那种情况下旧值本来就该全部作废。
-    if [ -n "$PARTIAL_COLLECT" ]; then
+    if [ "$PARTIAL_COLLECT" -eq 1 ]; then
       merge_old_sections "$pfile" "$SECTIONS"
     fi
     printf '%s\n' "$out" | normalize_kv
+    if [ -n "$remain_stale" ]; then
+      printf 'stale_sections=%s\n' "$remain_stale"
+      local old_reason old_at
+      old_reason="$(pget "$pfile" stale_reason)"
+      old_at="$(pget "$pfile" stale_at)"
+      [ -n "$old_reason" ] && printf 'stale_reason=%s\n' "$old_reason"
+      [ -n "$old_at" ] && printf 'stale_at=%s\n' "$old_at"
+    fi
     printf '# 以下由 profile_store 管理，勿手工改\n'
     printf 'profile_updated=%s\n' "$now"
-  } > "$tmp" 2>"$tmp.warn" || { err "写入临时文件失败"; rm -f "$tmp"; exit 1; }
+  ) > "$tmp" 2>"$tmp.warn" || { err "写入临时文件失败"; rm -f "$tmp"; exit 1; }
 
   grep '^#WARN' "$tmp.warn" 2>/dev/null | sed 's/^/  /' >&2
   rm -f "$tmp.warn"
+  chmod 600 "$tmp" 2>/dev/null || true
 
   # ---------- 6. 身份校验后再落盘 ----------
-  local new_machine; new_machine="$(printf '%s\n' "$out" | sed -n 's/^machine_id=//p' | head -1)"
-  if [ -f "$pfile" ] && [ -n "${old_machine:-}" ] && [ -n "$new_machine" ] && [ "$old_machine" != "$new_machine" ]; then
-    if [ "$FORCE" -eq 1 ]; then
-      warn "machine_id 变了（原 ${old_machine:0:12}… 现 ${new_machine:0:12}…），--force 已确认覆盖"
-    else
-      local alt="${pfile%.profile}.m2.profile"
-      mv "$tmp" "$alt" 2>/dev/null
-      err "检测到同一目标下换了一台机器（machine_id 不一致）："
-      err "  原档案: $pfile"
-      err "  新机器的采集结果另存为: $alt"
-      err "  如果确实重装/换机了，用 forget 删旧档案后重新 collect，或加 --force 覆盖。"
-      exit 3
+  if [ -f "$pfile" ]; then
+    local reason=""
+    if [ -n "$old_fp" ] && [ -n "$new_fp" ] && [ "$old_fp" != "$new_fp" ]; then
+      reason="主机密钥指纹变了（原 ${old_fp:0:20}… 现 ${new_fp:0:20}…）"
+    elif [ -n "$old_machine" ] && [ -n "$new_machine" ] && [ "$old_machine" != "$new_machine" ]; then
+      reason="machine_id 变了（原 ${old_machine:0:12}… 现 ${new_machine:0:12}…）"
+    elif [ -n "$old_fp" ] && [ -z "$new_fp" ]; then
+      warn "本次无法从 known_hosts 读到主机指纹，跳过指纹比对（machine_id 仍会比对）"
     fi
-  fi
-  if [ -f "$pfile" ] && [ -n "${old_fp:-}" ] && [ -n "$fp" ] && [ "$old_fp" != "$fp" ]; then
-    warn "主机密钥指纹变了（原 ${old_fp:0:20}… 现 ${fp:0:20}…）——"
-    warn "可能是重装系统，也可能是中间人。确认过来源再继续，必要时 forget 后重采。"
+    if [ -n "$reason" ]; then
+      if [ "$FORCE" -eq 1 ]; then
+        warn "$reason --force 已确认覆盖"
+      else
+        local alt="${pfile%.profile}.m2.profile"
+        mv "$tmp" "$alt" 2>/dev/null
+        err "检测到同一目标下换了一台机器/重装：$reason"
+        err "  原档案: $pfile"
+        err "  新机器的采集结果另存为: $alt"
+        err "  如果确实重装/换机了，用 forget 删旧档案后重新 collect，或加 --force 覆盖。"
+        exit 3
+      fi
+    fi
   fi
 
   mv "$tmp" "$pfile" || { err "落盘失败"; exit 1; }
+  chmod 600 "$pfile" 2>/dev/null || true
 
   # ---------- 7. 跨档案的 IP 冲突提示 ----------
-  local ip_primary; ip_primary="$(pget ip_primary "$pfile")"
+  local ip_primary other
+  ip_primary="$(pget "$pfile" ip_primary)"
   if [ -n "$ip_primary" ]; then
-    local other
-    other="$(grep -l -e "ip_primary=$ip_primary" -e "ip_all=$ip_primary" "$PROFILE_DIR"/*.profile 2>/dev/null \
-             | grep -v "^$pfile\$" | head -1)"
+    other="$(grep -lFx -e "ip_primary=$ip_primary" -e "ip_all=$ip_primary" "$PROFILE_DIR"/*.profile 2>/dev/null \
+             | grep -v -F -x "$pfile" | head -1)"
     [ -n "$other" ] && warn "IP $ip_primary 同时出现在 $(basename "$other") 里 —— 可能是两台机器共用出口 IP（NAT），或档案没清理"
   fi
 
-  # 摘要
   ok "档案已写入 $pfile (第 ${scan_count} 次采集)"
   do_show_short "$pfile"
 }
 
-# ---------- 紧凑画像：≤20 行，够判断"这台机器是什么"，别把 200 行原文倒进对话 ----------
+# ---------- 紧凑画像 ----------
 do_show_short() { # $1 = profile file
   local f="$1"
   [ -f "$f" ] || { err "档案不存在: $f"; exit 2; }
   printf '\n'
   printf '%s\n' "═══ 服务器画像 ═══"
-  line() { # line <key> <label> —— 值为空就整行不输出
-    local v; v="$(pget "$1" "$f")"
+  line() {
+    local v; v="$(pget "$f" "$1")"
     [ -n "$v" ] || return 0
     local w pad="" i
     w="$(dispwidth "$2")"
@@ -483,20 +713,21 @@ do_show_short() { # $1 = profile file
   line "latency_avg_ms" "延迟avg"
   grep -q '^latency_reliable=0' "$f" 2>/dev/null && printf '  延迟可信度        否（本机透明代理）\n'
   line "last_scan"    "上次采集"
-  local st; st="$(pget stale_sections "$f")"
-  [ -n "$st" ] && printf '  %s已标脏: %s（原因: %s）%s\n' "$C_YEL" "$st" "$(pget stale_reason "$f")" "$C_OFF"
+  local st; st="$(pget "$f" stale_sections)"
+  [ -n "$st" ] && printf '  %s已标脏: %s（原因: %s）%s\n' "$C_YEL" "$st" "$(pget "$f" stale_reason)" "$C_OFF"
   line "note"         "备注"
 }
 
 # ---------- show ----------
 do_show() {
-  local f; f="$(find_profile "$TARGET")" || { err "没有 $TARGET 的档案（先 collect）"; exit 2; }
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT")" || rc=$?
+  [ "$rc" -eq 0 ] || { err "没有 $TARGET 的档案（先 collect；多端口时加 -p）"; exit 2; }
   if [ "$SHORT" -eq 1 ]; then do_show_short "$f"; return 0; fi
   if [ -n "$FIELDS" ]; then
     local IFS=','
     for k in $FIELDS; do
       k="${k%%=*}"
-      # 列表键可能有多条（key.0, key.1...），全部打出来
       grep -E "^${k}(\.[0-9]+)?=" "$f" 2>/dev/null | sed 's/^/  /'
     done
   else
@@ -504,15 +735,13 @@ do_show() {
   fi
 }
 
-# ---------- list / table ----------
+# ---------- list ----------
 do_list() {
   [ -d "$PROFILE_DIR" ] || { dim "（还没有任何档案）"; return 0; }
-  # 表头是中文（双宽），printf 的 %-Ns 按字节补空格会错位，所以用 dispwidth 自己算列宽
-  col() { # col <字符串> <列宽> —— 恰好占用"列宽+1个空格"的显示宽度（含分隔空格）
+  col() {
     local s="$1" want="$2" w i pad="" acc="" c wc
     w="$(dispwidth "$s")"
     if [ "$w" -gt "$want" ]; then
-      # 按**显示宽度**截断（不能按字节切，会切坏 UTF-8），末位用 ~ 表示被截断
       acc=""; wc=0
       for ((i=0; i<${#s}; i++)); do
         c="${s:i:1}"
@@ -527,24 +756,24 @@ do_list() {
       return 0
     fi
     for ((i=w; i<want; i++)); do pad="$pad "; done
-    printf '%s%s ' "$s" "$pad"   # 末尾那个空格是列分隔，保证最后一列不会贴上来
+    printf '%s%s ' "$s" "$pad"
   }
-  local f short n=0
+  local f n=0
   for f in "$PROFILE_DIR"/*.profile; do [ -f "$f" ] && n=$((n+1)); done
   if [ "$n" -eq 0 ]; then dim "（还没有任何档案）"; return 0; fi
 
-  col "目标" 20; col "系统" 24; col "CPU" 26; col "内存MB" 9; col "上次采集" 19
+  col "目标" 20; col "系统" 24; col "CPU" 26; col "内存MB" 9; col "延迟avg" 9; col "上次采集" 19
   printf '状态\n'
   for f in "$PROFILE_DIR"/*.profile; do
     [ -f "$f" ] || continue
-    short="$(basename "$f" .profile)"
-    col "$(pget connect_target "$f" 2>/dev/null || echo "$short")" 20
-    col "$(pget os "$f" 2>/dev/null)" 24
-    col "$(pget cpu_model "$f" 2>/dev/null)" 26
-    col "$(pget mem_total_mb "$f" 2>/dev/null)" 9
-    col "$(pget last_scan "$f" 2>/dev/null | cut -c1-19)" 19
-    if [ -n "$(pget stale_sections "$f")" ]; then
-      printf '%s\n' "已标脏($(pget stale_sections "$f"))"
+    col "$(pget "$f" connect_target 2>/dev/null || echo "$(basename "$f" .profile)")" 20
+    col "$(pget "$f" os 2>/dev/null)" 24
+    col "$(pget "$f" cpu_model 2>/dev/null)" 26
+    col "$(pget "$f" mem_total_mb 2>/dev/null)" 9
+    col "$(pget "$f" latency_avg_ms 2>/dev/null)" 9
+    col "$(pget "$f" last_scan 2>/dev/null | cut -c1-19)" 19
+    if [ -n "$(pget "$f" stale_sections)" ]; then
+      printf '%s\n' "已标脏($(pget "$f" stale_sections))"
     else
       printf '新鲜\n'
     fi
@@ -553,22 +782,20 @@ do_list() {
 }
 
 # ---------- check ----------
-# 只发 1 次连接、只 cat 两个文件，判断"机器重启过没有"。
-# 重启过 => runtime/services/storage 基线失效，而 identity/hw 依然有效。
-# 这是免费的保鲜检查，比"每隔 N 天全量重采"便宜得多，也比"什么都不查"诚实。
 do_check() {
-  local f; f="$(find_profile "$TARGET")" || { err "没有 $TARGET 的档案"; exit 2; }
-  local old_boot; old_boot="$(pget boot_id "$f")"
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT")" || rc=$?
+  [ "$rc" -eq 0 ] || { err "没有 $TARGET 的档案（多端口时加 -p）"; exit 2; }
+  local old_boot; old_boot="$(pget "$f" boot_id)"
   [ -n "$old_boot" ] || { warn "档案里没有 boot_id（旧版档案），无法判断是否重启过"; exit 0; }
+
+  resolve_connection_meta "$f"
+  build_run_args
+  RUN_ARGS+=(-t 20 -c 'cat /proc/sys/kernel/random/boot_id 2>/dev/null; cut -d. -f1 /proc/uptime 2>/dev/null' \
+             --label "profile-check $TARGET")
   local cur crc
-  local -a cargs=(-q -H "$TARGET")
-  [ -n "$SSH_USER" ]     && cargs+=(-u "$SSH_USER")
-  [ -n "$SSH_PORT" ]     && cargs+=(-p "$SSH_PORT")
-  [ -n "$SSH_JUMP" ]     && cargs+=(-J "$SSH_JUMP")
-  [ -n "$SSH_IDENTITY" ] && cargs+=(-i "$SSH_IDENTITY")
-  cargs+=(-t 20 -c 'cat /proc/sys/kernel/random/boot_id 2>/dev/null; cut -d. -f1 /proc/uptime 2>/dev/null')
-  cur="$(bash "$SSH_EXEC" "${cargs[@]}" 2>/dev/null)"
-  crc=$?   # 必须在管道/替换之外取退出码：`cmd | tr` 的 $? 是 tr 的状态，永远是 0
+  cur="$(bash "$SSH_EXEC" "${RUN_ARGS[@]}" 2>/dev/null)"
+  crc=$?
   if [ "$crc" -ne 0 ] || [ -z "$cur" ]; then
     err "无法连接（ssh_exec.sh 退出码 $crc），档案状态未知"; exit 2
   fi
@@ -578,22 +805,71 @@ do_check() {
   new_up="$(printf '%s\n' "$cur" | sed -n '2p')"
   if [ "$new_boot" != "$old_boot" ]; then
     warn "机器重启过（boot_id 变了，当前 uptime ${new_up:-?}s）"
-    warn "失效段落: runtime/services/storage 基线；identity/hw 依然有效，无需重采。"
-    warn "刷新: profile_store.sh collect -H $TARGET --sections docker,services,storage"
+    warn "失效段落: runtimes/services/storage 基线；identity/hw 依然有效，无需重采。"
+    warn "刷新: profile_store.sh collect -H $TARGET --sections runtimes,services,storage"
     exit 1
   fi
   ok "机器未重启，档案基线仍有效 (uptime ${new_up:-?}s)"
 }
 
+# ---------- compare ----------
+do_compare() {
+  local list="$TARGETS" t f rc pair
+  local -a PFILES=() HOSTS=()
+  list="$(printf '%s' "$list" | tr ',' ' ')"
+  for t in $list; do
+    rc=0
+    f="$(find_profile "$t" "" 2>/dev/null)" || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$f" ]; then
+      err "没有 $t 的档案"; exit 2
+    fi
+    PFILES+=("$f")
+    HOSTS+=("$t")
+  done
+  [ "${#HOSTS[@]}" -ge 2 ] || { err "compare 至少需要两个目标（-H a,b 或重复 -H）"; exit 1; }
+
+  local width=18
+  row() { # label values...
+    local lab="$1"; shift
+    local w pad="" i val
+    w="$(dispwidth "$lab")"
+    for ((i=w; i<width; i++)); do pad="$pad "; done
+    printf '%s%s' "$lab" "$pad"
+    for val in "$@"; do
+      printf '%-24s ' "$val"
+    done
+    printf '\n'
+  }
+  printf '%s\n' "═══ 档案对比 ═══"
+  row "字段" "${HOSTS[@]}"
+  for pair in "os|系统" "kernel|内核" "virt|虚拟化" "cpu_model|CPU" "cpu_cores|物理核" "cpu_threads|线程" "mem_total_mb|内存MB" "dmi_product_name|机型" "ip_primary|主IP" "latency_avg_ms|延迟avg"; do
+    local field="${pair%%|*}" label="${pair#*|}"
+    local -a VALS=()
+    for f in "${PFILES[@]}"; do
+      VALS+=("$(pget "$f" "$field")")
+    done
+    for t in "${!VALS[@]}"; do [ -n "${VALS[$t]}" ] || VALS[$t]="-"; done
+    row "$label" "${VALS[@]}"
+  done
+  local -a VALS=()
+  for f in "${PFILES[@]}"; do VALS+=("$(grep -c '^docker_container\.' "$f" 2>/dev/null)"); done
+  row "容器数" "${VALS[@]}"
+  VALS=()
+  for f in "${PFILES[@]}"; do VALS+=("$(grep -c '^unit_running\.' "$f" 2>/dev/null)"); done
+  row "运行服务数" "${VALS[@]}"
+}
+
 # ---------- set ----------
-# 更新档案里的标量字段。列表键（docker_container 之类）不允许在这里改 ——
-# 它们由采集器生成，手改会在下次采集时被覆盖，造成"改了又没了"的错觉。
 do_set() {
-  local f; f="$(find_profile "$TARGET")" || { err "没有 $TARGET 的档案"; exit 2; }
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT")" || rc=$?
+  [ "$rc" -eq 0 ] || { err "没有 $TARGET 的档案（多端口时加 -p）"; exit 2; }
+  [ -n "$NOTE" ] && SET_PAIRS="$SET_PAIRS
+note=$NOTE"
   [ -n "${SET_PAIRS// /}" ] || { err "没有要更新的字段。用法: set -H web1 note=\"生产库，别乱动\" os_label=..."; exit 1; }
   local tmp="$f.tmp.$$"
-  cp "$f" "$tmp" || exit 1
-  local changed=0 k v
+  ( umask 077; cp "$f" "$tmp" ) || exit 1
+  local changed=0 pair k v
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
     k="${pair%%=*}"; v="${pair#*=}"
@@ -601,13 +877,17 @@ do_set() {
       [A-Za-z_][A-Za-z0-9_]*) ;;
       *) err "非法键名: $k"; rm -f "$tmp"; exit 1 ;;
     esac
+    case "$k" in
+      connect_target|ssh_user|ssh_port|ssh_jump|ssh_identity|machine_id|boot_id|first_seen|last_scan|scan_count|collector_sha256|host_key_fp|stale_sections|stale_reason|stale_at|profile_updated)
+        err "字段 $k 由采集器维护，不能用 set 修改"; rm -f "$tmp"; exit 1 ;;
+    esac
     if is_list_key "$k"; then
       warn "跳过列表键 $k（由采集器维护，手改会在下次采集时被覆盖）"
       continue
     fi
+    v="$(printf '%s' "$v" | tr '\n\r\t' '   ')"
     if grep -q "^${k}=" "$tmp"; then
-      # 用 awk 而不是 sed -i：值里可能有 | / 等字符，sed 的分隔符会被打断
-      awk -v k="$k" -v v="$v" 'BEGIN{FS=OFS="="} $1==k {$1=k; print k"="v; next} {print}' \
+      V="$v" awk -v k="$k" 'BEGIN{FS=OFS="="} $1==k {print k"="ENVIRON["V"]; next} {print}' \
         "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"
     else
       printf '%s=%s\n' "$k" "$v" >> "$tmp"
@@ -617,7 +897,9 @@ do_set() {
 $SET_PAIRS
 EOF
   if [ "$changed" -gt 0 ]; then
+    grep -v '^profile_updated=' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"
     printf 'profile_updated=%s\n' "$(now_utc)" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
     mv "$tmp" "$f" && ok "已更新 $changed 个字段: $f"
   else
     rm -f "$tmp"
@@ -628,38 +910,46 @@ EOF
 
 # ---------- mark-stale ----------
 do_mark_stale() {
-  local f; f="$(find_profile "$TARGET")" || return 0   # 没有档案就不用标，静默返回
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT")" || rc=$?
+  [ "$rc" -eq 3 ] && return 0
+  [ "$rc" -eq 0 ] || return 0
   [ -n "$STALE_SECTIONS" ] || { err "需要 --sections 指明哪些段落失效了"; exit 1; }
   local tmp="$f.tmp.$$"
   local now; now="$(now_utc)"
-  # 合并已有的 stale_sections（不覆盖别的段落）
-  local old; old="$(pget stale_sections "$f")"
+  local old; old="$(pget "$f" stale_sections)"
   local merged="$STALE_SECTIONS"
   [ -n "$old" ] && merged="$old,$STALE_SECTIONS"
   merged="$(printf '%s' "$merged" | tr ',' '\n' | awk '!seen[$0]++' | paste -sd, -)"
-  {
-    grep -v -e '^stale_sections=' -e '^stale_reason=' -e '^stale_at=' "$f"
+  (
+    umask 077
+    grep -v -e '^stale_sections=' -e '^stale_reason=' -e '^stale_at=' -e '^profile_updated=' "$f"
     printf 'stale_sections=%s\n' "$merged"
     [ -n "$STALE_REASON" ] && printf 'stale_reason=%s\n' "$STALE_REASON"
     printf 'stale_at=%s\n' "$now"
-  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    printf 'profile_updated=%s\n' "$now"
+  ) > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 0; }
   dim "  档案已标脏: $merged"
 }
 
 # ---------- hint ----------
-# 给 ssh_exec.sh 用的一行提示：只在"可操作"时输出（缺档案 / 已标脏 / 机器重启过）。
-# 档案新鲜就什么都不打印 —— 否则每次连接都刷一行就成了新的噪音。
 do_hint() {
-  local f
-  if ! f="$(find_profile "$TARGET")"; then
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 3 ]; then
+    printf '[档案不唯一] %s 有多个端口的档案，请加 -p 指定\n' "$TARGET"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
     printf '[无档案] 首次连这台，可跑: profile_store.sh collect -H %s\n' "$TARGET"
     return 0
   fi
-  local st; st="$(pget stale_sections "$f")"
+  local st; st="$(pget "$f" stale_sections)"
   if [ -n "$st" ]; then
     printf '[档案已标脏: %s] 原因: %s — 需要时刷新: collect -H %s --sections %s\n' \
-      "$st" "$(pget stale_reason "$f")" "$TARGET" "$st"
+      "$st" "$(pget "$f" stale_reason)" "$TARGET" "$st"
     return 0
   fi
   return 0
@@ -667,19 +957,27 @@ do_hint() {
 
 # ---------- forget ----------
 do_forget() {
-  local f; f="$(find_profile "$TARGET")" || { err "没有 $TARGET 的档案"; exit 2; }
-  rm -f "$f" "${f%.profile}.m2.profile" "${f%.profile}.partial" && ok "已删除 $f"
+  local f rc=0
+  f="$(find_profile "$TARGET" "$SSH_PORT")" || rc=$?
+  [ "$rc" -eq 0 ] || { err "没有 $TARGET 的档案（多端口时加 -p）"; exit 2; }
+  local alt="${f%.profile}.m2.profile" partial="${f%.profile}.partial"
+  rm -f "$f" "$alt" "$partial" && ok "已删除 $f"
 }
 
 # ---------- 分发 ----------
 case "$CMD" in
   collect)    do_collect ;;
-  find)       f="$(find_profile "$TARGET")" || { dim "没有 $TARGET 的档案"; exit 2; }
-              echo "$f"
-              do_show_short "$f" ;;
+  find)
+    f="$(find_profile "$TARGET" "$SSH_PORT")" || {
+      [ $? -eq 3 ] || dim "没有 $TARGET 的档案"
+      exit 2
+    }
+    echo "$f"
+    do_show_short "$f" ;;
   show)       do_show ;;
   list)       do_list ;;
   check)      do_check ;;
+  compare)    do_compare ;;
   set)        do_set ;;
   mark-stale) do_mark_stale ;;
   hint)       do_hint ;;

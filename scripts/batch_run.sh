@@ -17,6 +17,7 @@
 
 set -uo pipefail
 LC_ALL=C
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSH_EXEC="$SCRIPT_DIR/ssh_exec.sh"
@@ -48,6 +49,7 @@ PASSWORD_ENV=""
 CREDENTIAL_FILE=""
 PROMPT_CREDENTIAL=0
 SAVE_CREDENTIAL=0
+USE_SAVED_CREDENTIAL=0
 
 if [ -t 1 ]; then C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
 else C_RED=""; C_YEL=""; C_GRN=""; C_DIM=""; C_OFF=""; fi
@@ -76,17 +78,18 @@ usage() {
   --stop-on-error        任一台失败即停止派发后续主机
   --dry-run              只打印目标清单与风险判定，不执行
   --confirm-danger       声明已就高危命令向用户二次确认
-  --yes                  确认目标清单（目标超过 10 台时必须显式给出）
+  --yes                  确认目标清单（任何变更/高危批量都必须显式给出）
   --max-output-lines N   成功主机最多回显多少行输出（默认 40，失败主机总是全量回显）
 
 连接默认值（可被清单中的逐机配置覆盖）:
   --user U  --port P  --jump J  --identity FILE
 
 认证（口令一次输入，每台机器复用；不进命令行、不进 ps、不进审计日志）:
-  --auth MODE            auto（默认）| key | password
+  --auth MODE            auto（默认）| key | password；命令行值覆盖 inventory 的 auth
   --prompt-credential    交互式输入一次（无终端时改用下面两种）
   --password-env VAR     从环境变量读
   --credential-file F    从文件读（建议 0600）
+  --use-saved-credential 读取之前 --save-credential 保存的口令
   --save-credential      把口令存到 ~/.ssh-server-manager/credentials（默认不存）
 USAGE
 }
@@ -118,14 +121,26 @@ while [ $# -gt 0 ]; do
     --credential-file) need_arg "$1" $#; CREDENTIAL_FILE="$2"; shift 2 ;;
     --prompt-credential) PROMPT_CREDENTIAL=1; shift ;;
     --save-credential) SAVE_CREDENTIAL=1; shift ;;
+    --use-saved-credential) USE_SAVED_CREDENTIAL=1; shift ;;
     -h|--help)         usage; exit 0 ;;
     *)                 err "未知选项: $1（用 --help 查看用法）"; exit 2 ;;
   esac
 done
 
 [ -n "$CMD" ] || { err "缺少 --cmd（要执行的命令）"; exit 2; }
-case "${PARALLEL}${TIMEOUT}${MAX_OUTPUT_LINES}" in *[!0-9]*) err "并发/超时/行数必须是整数"; exit 2 ;; esac
+case "$PARALLEL" in ''|*[!0-9]*) err "--parallel 必须是整数"; exit 2 ;; esac
+case "$TIMEOUT" in ''|*[!0-9]*) err "--timeout 必须是整数"; exit 2 ;; esac
+case "$MAX_OUTPUT_LINES" in ''|*[!0-9]*) err "--max-output-lines 必须是整数"; exit 2 ;; esac
 [ "$PARALLEL" -ge 1 ] || { err "--parallel 至少为 1"; exit 2; }
+[ "$TIMEOUT" -ge 1 ] || { err "--timeout 至少为 1"; exit 2; }
+[ "$MAX_OUTPUT_LINES" -ge 1 ] || { err "--max-output-lines 至少为 1"; exit 2; }
+case "$AUTH_MODE" in ''|auto|key|password) ;; *) err "--auth 只能是 auto|key|password"; exit 2 ;; esac
+if [ "$AUTH_MODE" = "key" ] && { [ -n "$PASSWORD_ENV" ] || [ -n "$CREDENTIAL_FILE" ] || [ "$PROMPT_CREDENTIAL" -eq 1 ] || [ "$SAVE_CREDENTIAL" -eq 1 ] || [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; }; then
+  err "--auth key 与密码相关选项冲突"; exit 2
+fi
+if [ -n "$TAGS" ] && [ -z "$INVENTORY" ]; then
+  err "--tags 只能和 --inventory 一起使用"; exit 2
+fi
 [ -x "$SSH_EXEC" ] || [ -f "$SSH_EXEC" ] || { err "找不到 ssh_exec.sh（应与本脚本同目录）"; exit 2; }
 
 # ---------- 目标清单解析 ----------
@@ -171,6 +186,9 @@ if not isinstance(doc, dict):
     sys.exit(1)
 
 defaults = doc.get("defaults") or {}
+if not isinstance(defaults, dict):
+    sys.stderr.write("inventory 的 defaults 必须是映射\n")
+    sys.exit(1)
 hosts = doc.get("hosts") or []
 if not isinstance(hosts, list):
     sys.stderr.write("inventory 的 hosts 必须是列表\n")
@@ -190,13 +208,19 @@ for entry in hosts:
 
     tags = entry.get("tags", defaults.get("tags")) or []
     if isinstance(tags, str):
-        tags = [tags]
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
     if tags_filter and not (set(tags_filter) & set(str(t) for t in tags)):
         continue
     label = str(entry.get("alias") or entry.get("host") or "")
     host = str(entry.get("host") or entry.get("alias") or "")
     if not host:
         continue
+    auth = resolve("auth")
+    if auth == "-":
+        auth = ""
+    if auth not in ("", "auto", "key", "password"):
+        sys.stderr.write("inventory: %s 的 auth 必须是 auto/key/password，实际是 %r\n" % (label, auth))
+        sys.exit(1)
     fields = [
         label,
         host,
@@ -204,7 +228,15 @@ for entry in hosts:
         resolve("port"),
         resolve("jump"),
         resolve("identity_file"),
+        auth,
     ]
+    for v in fields:
+        if "|" in v or "\n" in v or "\r" in v:
+            sys.stderr.write("inventory: %s 的字段包含 | 或换行，拒绝继续\n" % label)
+            sys.exit(1)
+    if any(ch.isspace() for ch in host):
+        sys.stderr.write("inventory: %s 的 host 含有空白字符，拒绝继续\n" % label)
+        sys.exit(1)
     print("|".join(fields))
 PY
 }
@@ -221,10 +253,10 @@ elif [ -n "$HOSTS_FILE" ]; then
       if (n == 0 || f[1] == "") next;
       user = (n >= 3) ? f[3] : "";
       port = (n >= 2) ? f[2] : "";
-      printf "%s|%s|%s|%s||\n", f[1], f[1], user, port;
+      printf "%s|%s|%s|%s|||\n", f[1], f[1], user, port;
     }' "$HOSTS_FILE")"
 elif [ -n "$HOSTS_INLINE" ]; then
-  HOSTS_RAW="$(for h in $HOSTS_INLINE; do printf '%s|%s||||\n' "$h" "$h"; done)"
+  HOSTS_RAW="$(for h in $HOSTS_INLINE; do printf '%s|%s|||||\n' "$h" "$h"; done)"
 elif [ "$FROM_SSH_CONFIG" -eq 1 ]; then
   cfg="${HOME}/.ssh/config"
   [ -f "$cfg" ] || { err "找不到 $cfg"; exit 2; }
@@ -247,7 +279,7 @@ elif [ "$FROM_SSH_CONFIG" -eq 1 ]; then
           # ssh config 里的 Host 模式（含通配符）不是具体机器，跳过
           if (a ~ /[*?]/) continue
           if (filt != "" && a !~ pat) continue
-          printf "%s|%s||||\n", a, a
+          printf "%s|%s|||||\n", a, a
         }
       }' "$cfg")"
 else
@@ -258,17 +290,24 @@ fi
 # 应用 --exclude 与命令行连接默认值。
 # "-" 表示清单里显式留空（该字段就该为空），不能被命令行默认值填回去。
 HOSTS_RAW="$(printf '%s\n' "$HOSTS_RAW" | awk -F'|' -v ex="$EXCLUDE" -v du="$DEF_USER" -v dp="$DEF_PORT" \
-  -v dj="$DEF_JUMP" -v di="$DEF_IDENTITY" '
+  -v dj="$DEF_JUMP" -v di="$DEF_IDENTITY" -v da="$AUTH_MODE" '
   BEGIN { n = split(ex, e, ","); for (i = 1; i <= n; i++) skip[e[i]] = 1 }
-  NF >= 2 && $2 != "" {
+  $0 == "" { next }
+  NF != 7 { print "batch_run: 目标行字段数不是 7（可能含 |）: " $0 > "/dev/stderr"; bad=1; next }
+  $2 != "" {
     if ($1 in skip || $2 in skip) next
-    for (i = 3; i <= 6; i++) if ($i == "-") $i = ""
+    for (i = 3; i <= 7; i++) if ($i == "-") $i = ""
     if ($3 == "") $3 = du
     if ($4 == "") $4 = dp
     if ($5 == "") $5 = dj
     if ($6 == "") $6 = di
-    printf "%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6
-  }')"
+    if (da != "") $7 = da
+    key = $2 "|" $4
+    if (key in seen) { print "batch_run: 跳过重复目标: " $1 " (" $2 ":" ($4 == "" ? 22 : $4) ")" > "/dev/stderr"; next }
+    seen[key] = 1
+    printf "%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7
+  }
+  END { if (bad) exit 2 }')" || { err "目标清单包含非法字段（很可能含有 | 或换行）"; exit 2; }
 
 COUNT="$(printf '%s\n' "$HOSTS_RAW" | grep -c . || true)"
 if [ "${COUNT:-0}" -eq 0 ]; then
@@ -280,7 +319,7 @@ fi
 printf '%s目标清单（%s 台）:%s\n' "$C_YEL" "$COUNT" "$C_OFF"
 printf '%s\n' "$HOSTS_RAW" | awk -F'|' '{
   tgt = $2; if ($3 != "") tgt = $3 "@" tgt; if ($4 != "") tgt = tgt ":" $4;
-  extra = ""; if ($5 != "") extra = extra "  jump=" $5; if ($6 != "") extra = extra "  key=" $6;
+  extra = ""; if ($5 != "") extra = extra "  jump=" $5; if ($6 != "") extra = extra "  key=" $6; if ($7 != "") extra = extra "  auth=" $7;
   printf "  %-16s %s%s\n", $1, tgt, extra
 }'
 
@@ -314,9 +353,10 @@ if [ "$PROMPT_CREDENTIAL" -eq 1 ] && [ -z "${SSHMGR_PASSWORD:-}" ]; then
 fi
 
 # ---------- 风险判定（复用 ssh_exec.sh，保证分级只有一处定义） ----------
+# --print-tier 是稳定接口：只输出 0/1/2，不连接、不需要目标主机。
+TIER="$(bash "$SSH_EXEC" --print-tier -c "$CMD" 2>/dev/null)"
+case "$TIER" in 0|1|2) ;; *) TIER=0 ;; esac
 TIER_OUT="$(bash "$SSH_EXEC" -H "$(printf '%s\n' "$HOSTS_RAW" | head -1 | cut -d'|' -f2)" --dry-run -c "$CMD" 2>&1)"
-TIER="$(printf '%s\n' "$TIER_OUT" | sed -n 's/^风险等级  : tier\([0-9]\).*/\1/p' | head -1)"
-TIER="${TIER:-0}"
 TIER_WHY="$(printf '%s\n' "$TIER_OUT" | sed -n 's/^风险等级  : tier[0-9] (\(.*\))/\1/p' | head -1)"
 printf '%s风险等级:%s tier%s%s\n' "$C_YEL" "$C_OFF" "$TIER" "${TIER_WHY:+  ($TIER_WHY)}"
 
@@ -329,7 +369,7 @@ fi
 
 # ---------- 变更类操作的确认门槛 ----------
 # 一次动 N 台机器时，"清单没看仔细"本身就是主要事故来源，所以这里不给跳过清单确认的余地。
-if [ "$TIER" -ge 1 ] && [ "$COUNT" -gt 10 ] && [ "$ASSUME_YES" -ne 1 ]; then
+if [ "$TIER" -ge 1 ] && [ "$ASSUME_YES" -ne 1 ]; then
   err "变更类命令作用于 ${COUNT} 台主机，需要显式加 --yes 确认目标清单无误。"
   printf '  先核对上面的清单：多一台或少一台，影响面都不一样。\n' >&2
   exit 3
@@ -344,6 +384,9 @@ if [ "$TIER" -ge 1 ]; then
   if [ "$PARALLEL" -gt 1 ] && [ "$STOP_ON_ERROR" -ne 1 ]; then
     warn "并发 ${PARALLEL} 且未加 --stop-on-error：首次执行建议 --parallel 1 --stop-on-error。"
   fi
+  if [ "$STOP_ON_ERROR" -eq 1 ] && [ "$PARALLEL" -gt 1 ]; then
+    warn "--stop-on-error 只能阻止尚未派发的目标；最多 ${PARALLEL} 台已启动主机会继续跑完。"
+  fi
 fi
 
 # ---------- 执行 ----------
@@ -352,15 +395,18 @@ fi
 # 与 ssh_exec.sh / profile_store.sh 认同一个家目录（SSHMGR_HOME 优先）
 LOG_DIR="${SSHMGR_HOME:-${SSHMGR_LOG_DIR:-$HOME/.ssh-server-manager}}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-if mkdir -p "$LOG_DIR/batch-$STAMP" 2>/dev/null; then
-  OUTDIR="$LOG_DIR/batch-$STAMP"
-else
+OUTDIR=""
+if mkdir -p "$LOG_DIR" 2>/dev/null; then
+  OUTDIR="$(mktemp -d "$LOG_DIR/batch-$STAMP.XXXXXX" 2>/dev/null)" || OUTDIR=""
+fi
+if [ -z "$OUTDIR" ]; then
   OUTDIR="$(mktemp -d "${TMPDIR:-/tmp}/sshmgr-batch.XXXXXX")" || { err "无法创建输出目录"; exit 2; }
   warn "无法写入 $LOG_DIR，输出改存到临时目录 $OUTDIR（退出后可能被清理）"
 fi
+chmod 700 "$OUTDIR" 2>/dev/null || true
 
-run_one() {
-  local label="$1" host="$2" user="$3" port="$4" jump="$5" ident="$6"
+run_one() { # idx label host user port jump ident auth
+  local idx="$1" label="$2" host="$3" user="$4" port="$5" jump="$6" ident="$7" hauth="$8"
   local args=(-H "$host")
   [ -n "$user" ] && args+=(-u "$user")
   [ -n "$port" ] && args+=(-p "$port")
@@ -368,20 +414,24 @@ run_one() {
   [ -n "$ident" ] && args+=(-i "$ident")
   args+=(-t "$TIMEOUT" -c "$CMD")
   [ "$CONFIRM_DANGER" -eq 1 ] && args+=(--confirm-danger)
-  # 认证选项透传到每台机器。口令本身留在环境变量/文件里由 ssh_exec.sh 读取，
+  # 认证选项透传到每台机器。命令行 --auth 覆盖 inventory 的逐机 auth。
+  local use_auth="$hauth"
+  [ -n "$AUTH_MODE" ] && use_auth="$AUTH_MODE"
+  [ -n "$use_auth" ] && args+=(--auth "$use_auth") || true
+  # 口令本身留在环境变量/文件里由 ssh_exec.sh 读取，
   # 不进这个参数数组 —— ps 里看不到，审计日志里也不会记。
-  [ -n "$AUTH_MODE" ] && args+=(--auth "$AUTH_MODE") || true
   [ -n "$PASSWORD_ENV" ] && args+=(--password-env "$PASSWORD_ENV") || true
   [ -n "$CREDENTIAL_FILE" ] && args+=(--credential-file "$CREDENTIAL_FILE") || true
   [ "$PROMPT_CREDENTIAL" -eq 1 ] && [ "${SSHMGR_PW_CACHED:-0}" != "1" ] && args+=(--prompt-credential) || true
   [ "$SAVE_CREDENTIAL" -eq 1 ] && args+=(--save-credential) || true
+  [ "$USE_SAVED_CREDENTIAL" -eq 1 ] && args+=(--use-saved-credential) || true
 
   {
     printf '### %s  (%s)\n' "$label" "$host"
     printf '### cmd: %s\n\n' "$CMD"
-  } > "$OUTDIR/$label.log"
-  bash "$SSH_EXEC" "${args[@]}" >> "$OUTDIR/$label.log" 2>&1
-  printf '%s' "$?" > "$OUTDIR/$label.rc"
+  } > "$OUTDIR/$idx.log"
+  bash "$SSH_EXEC" "${args[@]}" >> "$OUTDIR/$idx.log" 2>&1
+  printf '%s' "$?" > "$OUTDIR/$idx.rc"
 }
 
 # --stop-on-error：只要已有任何一台失败，就不再派发新主机。
@@ -402,15 +452,17 @@ printf '\n%s开始执行（并发 %s，单机超时 %ss）...%s\n' "$C_DIM" "$PA
 
 pids=()
 aborted=0
-while IFS='|' read -r label host user port jump ident; do
+host_idx=0
+while IFS='|' read -r label host user port jump ident hauth; do
   [ -n "$host" ] || continue
+  host_idx=$((host_idx + 1))
   if [ "$aborted" -eq 1 ]; then
-    printf '%s' "skipped" > "$OUTDIR/$label.rc"
-    printf '### %s  (%s)\n### 已跳过（--stop-on-error：前序主机失败后停止派发）\n' "$label" "$host" > "$OUTDIR/$label.log"
+    printf '%s' "skipped" > "$OUTDIR/$host_idx.rc"
+    printf '### %s  (%s)\n### 已跳过（--stop-on-error：前序主机失败后停止派发）\n' "$label" "$host" > "$OUTDIR/$host_idx.log"
     continue
   fi
   printf '  -> 派发 %s\n' "$label"
-  run_one "$label" "$host" "$user" "$port" "$jump" "$ident" &
+  run_one "$host_idx" "$label" "$host" "$user" "$port" "$jump" "$ident" "$hauth" &
   pids+=( $! )
   if [ "${#pids[@]}" -ge "$PARALLEL" ]; then
     wait "${pids[0]}" 2>/dev/null || true
@@ -433,10 +485,12 @@ OK_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 FAILED_LIST=""
+host_idx=0
 
 while IFS='|' read -r label host _rest; do
   [ -n "$host" ] || continue
-  rc="$(cat "$OUTDIR/$label.rc" 2>/dev/null || echo unknown)"
+  host_idx=$((host_idx + 1))
+  rc="$(cat "$OUTDIR/$host_idx.rc" 2>/dev/null || echo unknown)"
   case "$rc" in
     0)        OK_COUNT=$((OK_COUNT + 1));   STATUS="${C_GRN}OK${C_OFF}" ;;
     skipped)  SKIP_COUNT=$((SKIP_COUNT + 1)); STATUS="${C_DIM}SKIPPED${C_OFF}" ;;
@@ -445,11 +499,11 @@ while IFS='|' read -r label host _rest; do
   printf '  %-20s %s\n' "$label" "$STATUS"
   if [ "$rc" = "0" ]; then
     printf '%s\n' "$C_DIM"
-    tail -n "$MAX_OUTPUT_LINES" "$OUTDIR/$label.log" 2>/dev/null | sed 's/^/      /'
+    tail -n "$MAX_OUTPUT_LINES" "$OUTDIR/$host_idx.log" 2>/dev/null | sed 's/^/      /'
     printf '%s\n' "$C_OFF"
   elif [ "$rc" != "skipped" ]; then
     # 失败主机全量回显：诊断信息通常就在被截断的那几行里
-    cat "$OUTDIR/$label.log" 2>/dev/null | sed 's/^/      /'
+    cat "$OUTDIR/$host_idx.log" 2>/dev/null | sed 's/^/      /'
   fi
 done <<< "$HOSTS_RAW"
 

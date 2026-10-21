@@ -2,10 +2,10 @@
 # Server inventory template
 #
 # Copy it to your own inventory.yaml and use that:
-#   cp assets/inventory.example.yaml ~/.ssh-server-manager/inventory.yaml
+#   cp "$SKILL_DIR/assets/inventory.example.yaml" ~/.ssh-server-manager/inventory.yaml
 #
 # Usage:
-#   ./scripts/batch_run.sh --inventory ~/.ssh-server-manager/inventory.yaml \
+#   bash "$SKILL_DIR/scripts/batch_run.sh" --inventory ~/.ssh-server-manager/inventory.yaml \
 #     --tags web --cmd 'uptime'
 #
 # Security conventions -- this file ends up in git and gets pasted into chats, so:
@@ -31,6 +31,7 @@ defaults:
   #   auto (default)  use a key if one works, otherwise use a password -- usually omit this
   #   password        explicitly use a password (disables pubkey attempts, so a pile of keys
   #                   in ssh-agent doesn't burn through MaxAuthTries)
+  #   This field is honoured per host by batch_run.sh. A command-line --auth overrides it.
   # auth: auto
   # Global jump host; override `jump` on a host that needs a different one
   jump: bastion
@@ -93,8 +94,8 @@ hosts:
 
   # A password-login host: note that **no password goes here**. Supply it at call time with
   # --prompt-credential / --password-env / --credential-file.
-  #   ./scripts/ssh_exec.sh -H legacy1 -u root --prompt-credential -c 'uptime'
-  #   ./scripts/batch_run.sh --hosts 'legacy1 legacy2' --cmd 'uptime' --prompt-credential
+  #   bash "$SKILL_DIR/scripts/ssh_exec.sh" -H legacy1 -u root --prompt-credential -c 'uptime'
+  #   bash "$SKILL_DIR/scripts/batch_run.sh" --hosts 'legacy1 legacy2' --cmd 'uptime' --prompt-credential
   - alias: legacy1
     host: 203.0.113.60
     user: root

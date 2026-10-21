@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Offline stand-in for OpenSSH. Records argv, never opens a socket.
+set -uo pipefail
+
+if [ -n "${FAKE_SSH_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
+fi
+
+case " $* " in
+  *"fail-host"*) exit 9 ;;
+esac
+
+for a in "$@"; do
+  if [ "$a" = "-G" ]; then
+    printf 'hostname %s\n' "${FAKE_SSH_G_HOST:-fake-host}"
+    printf 'port %s\n' "${FAKE_SSH_G_PORT:-22}"
+    printf 'user %s\n' "${FAKE_SSH_G_USER:-deploy}"
+    printf 'userknownhostsfile %s\n' "${FAKE_SSH_G_KH:-$HOME/.ssh/known_hosts}"
+    exit 0
+  fi
+done
+
+if [ "${FAKE_SSH_EXEC_STDIN:-0}" = "1" ]; then
+  case " $* " in
+    *" bash -s"*) exec bash ;;
+  esac
+fi
+
+if [ -n "${FAKE_SSH_OUTPUT:-}" ] && [ -f "$FAKE_SSH_OUTPUT" ]; then
+  cat "$FAKE_SSH_OUTPUT"
+fi
+exit "${FAKE_SSH_RC:-0}"

@@ -1,6 +1,6 @@
 ---
 name: ssh-server-manager
-description: Use when the user wants to connect to, inspect, deploy to, or troubleshoot a remote Linux server over SSH, even when they never say SSH. Supports account+password login — no key setup needed first. Trigger on Chinese phrases such as ssh 登录, 远程服务器, 登录服务器, 用账号密码登录, 密码登录, 运维, 部署上线, 重启服务, 查日志, 服务器挂了, 网站 502, 磁盘满了, CPU 跑满, 服务器信息, 硬件信息, 服务器画像, 这台机器什么配置, 对比服务器, 第一次连这台, 批量执行, 多台机器, 上传下载文件, 跳板机, 免密登录; and English phrases such as ssh into, remote server, server ops, deploy to prod, restart nginx, tail the logs, check server health, disk space, firewall rules, batch run across hosts, password login, server inventory, hardware specs. Covers password/key auth, cached per-host profiles (hardware, Docker services, disk baseline), connectivity debugging, health checks, process/service management, logs, file transfer, package/Docker deploys, firewall/user administration, and batch operations across hosts.
+description: Use when the user wants to connect to, inspect, deploy to, or troubleshoot a remote Linux server over SSH, even when they never say SSH. Supports account+password login — no key setup needed first. Trigger on Chinese phrases such as ssh 登录, 远程服务器, 登录服务器, 用账号密码登录, 密码登录, 运维, 部署上线, 重启服务, 查日志, 服务器挂了, 网站 502, 磁盘满了, CPU 跑满, 服务器信息, 硬件信息, 服务器画像, 这台机器什么配置, 对比服务器, 第一次连这台, 批量执行, 多台机器, 上传下载文件, 跳板机, 免密登录; and English phrases such as ssh into, remote server, server ops, deploy to prod, restart nginx, tail the logs, check server health, disk space, firewall rules, batch run across hosts, password login, server inventory, hardware specs. Do not trigger for local-only shell work, container orchestration with no remote host, or code review. Covers password/key auth, cached per-host profiles (hardware, Docker services, disk baseline), connectivity debugging, health checks, process/service management, logs, file transfer, package/Docker deploys, firewall/user administration, and batch operations across hosts.
 compatibility: Local machine needs ssh, scp (rsync optional), and bash 4+. Password login uses ssh's built-in SSH_ASKPASS — no sshpass required. python3 is optional and only used to parse multi-host inventories. Target hosts must be Linux (Ubuntu/Debian/CentOS/Rocky/Alma); scripts execute remotely via `bash -s`.
 ---
 
@@ -13,6 +13,19 @@ Three properties of remote operations drive every rule below:
 1. **Remote actions are hard to undo.** A wrong delete locally might have a snapshot behind it; `rm -rf` on a remote host usually leaves nothing. So "reconnaissance read-only first, then act" is not process ceremony — it is the only reliable way to limit damage.
 2. **Breaking SSH or network config locks you out.** A bad `sshd_config`, `iptables -F`, or a default DROP policy means your only way back in is the cloud console's VNC. Keep an escape hatch before touching any of that.
 3. **Batch operations multiply mistakes.** One command across 1 host is a change; across 50 it is an incident. So always be able to print the exact target list first.
+
+## Locating This Skill's Files
+
+The harness tells you where this `SKILL.md` lives. Set `SKILL_DIR` before running any command:
+
+```bash
+for d in "$HOME/.claude/skills/ssh-server-manager" ".claude/skills/ssh-server-manager" "$PWD"; do
+  [ -f "$d/SKILL.md" ] && SKILL_DIR="$(cd "$d" && pwd)" && break
+done
+[ -n "${SKILL_DIR:-}" ] && bash "$SKILL_DIR/scripts/ssh_exec.sh" --selftest || echo "SKILL_DIR not found — stop and ask"
+```
+
+If the harness gives you an explicit skill directory, use that instead. Commands in this document are written as `scripts/...` for readability; prefix them with `$SKILL_DIR/` (or `cd "$SKILL_DIR"` first) so they work from any working directory.
 
 ## Safety Rules
 
@@ -35,7 +48,10 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
 
 - **Passwords are not written to disk by default.** The user will say so if they want that;
   at that point add `--save-credential` to store it in `~/.ssh-server-manager/credentials`.
+  Later invocations reuse it explicitly with `--use-saved-credential` — it is never read implicitly.
   Don't store it if they didn't ask.
+- **`--dry-run`, `--print-tier` and `--selftest` never read credentials and never connect.**
+  They are safe to run before asking the user for a password.
 - **Never use `sshpass -p`**: the password shows up in `ps` output. This script goes through
   ssh's own askpass; the password is handed to the helper via a private temp file that is
   deleted on exit. No sshpass needed.
@@ -58,17 +74,23 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
   fingerprint on first contact:
 
   ```bash
-  ssh-keyscan -t ed25519,rsa -p <port> <host> 2>/dev/null | ssh-keygen -lf -
+  # Scan and print candidates without writing anything
+  scripts/ssh_exec.sh -H <host> --show-host-key
   # After checking against the cloud console or an admin, hand the confirmed value to the
   # script — only then will it write the key.
   scripts/ssh_exec.sh -H <host> --accept-host-key --fingerprint SHA256:xxxx
   ```
 
-  With `--fingerprint`, a scanned fingerprint that does not match is **refused** — verification
-  becomes a mechanism rather than a promise.
+  `--fingerprint` must be the **complete** `SHA256:...` value and must match a scanned key
+  exactly; only that one key line is written. A prefix, a partial value, or a mismatch is
+  refused. `--accept-host-key` works on its own (no `-c` needed) and exits after writing.
+  The target alias, real hostname and port are resolved through `ssh -G`, so ssh_config
+  aliases and non-22 ports are handled correctly.
 - On `REMOTE HOST IDENTIFICATION HAS CHANGED`, suspect a reinstall or an IP change first; don't
   rush to delete the record. The script also refuses to overwrite an existing entry whose
   fingerprint differs, and points you at `ssh-keygen -R`.
+- A jump host is a separate trust decision: it must already be in `known_hosts` before
+  `--accept-host-key -J bastion` can scan the target through it.
 
 ### Command Risk Tiers
 
@@ -78,7 +100,14 @@ Assign a tier before running anything, and let the tier decide how you interact:
 |---|---|---|
 | **Read-only** | df, du, ps, top, cat, ls, tail, head, grep, journalctl, systemctl status, ss, netstat, ip, free, uptime, last, lsblk, docker ps | Run directly |
 | **Mutating** | systemctl start/stop/restart/reload/enable, apt·yum·dnf install/remove/upgrade, editing config files, chmod/chown, mv, sed -i, docker stop/rm/compose up·down, git pull deploys, ufw allow | State the blast radius and the rollback path first, then wait for confirmation |
-| **Dangerous** | rm -rf, dd, mkfs, fdisk/parted, truncate, chmod -R 777, chown -R on system directories, iptables -F, ufw disable / turning off the firewall, editing sshd_config, reboot/shutdown/halt, DROP·TRUNCATE DATABASE, kill -9 on system processes, overwriting files under /etc | Double confirmation required: show the user the exact command and ask once explicitly, and present the rollback plan up front |
+| **Dangerous** | rm -r, dd, mkfs, fdisk/parted, truncate, chmod -R 777, chown -R on system directories, iptables -F, ufw disable / turning off the firewall, editing sshd_config/fstab/sudoers, reboot/shutdown/halt, DROP·TRUNCATE DATABASE, kill -9 on system processes, overwriting files under /etc | Double confirmation required: show the user the exact command and ask once explicitly, and present the rollback plan up front |
+
+Classification is a guardrail, not a sandbox: it understands command position and common
+write targets, but cannot see inside `python -c`, dynamically assembled scripts, or arbitrary
+binaries. Do not treat "tier 0" as proof that a command is harmless.
+
+Read-only commands that merely *mention* a dangerous word — `cat /etc/ssh/sshd_config`,
+`journalctl | grep reboot`, `ps aux | grep fio` — are correctly left at tier 0.
 
 **Prefer the reversible form.** This is not formalism: if `reload` fails you can revert to the
 old config; if `restart` fails the service is simply down.
@@ -122,11 +151,15 @@ firewall rules, `fstab`, `/etc/sudoers` — follow this order:
 
 Record every remote command you run to a local log, in the format
 `time | host | risk tier | exit code | duration | command`. Default location is
-`~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`.
+`~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`. Fields are escaped (`|` →
+`\|`, backslash → `\\`) so the line remains parseable.
 
 `scripts/ssh_exec.sh` writes this automatically; add entries by hand when you execute some
-other way. Why it's worth keeping: the first question in any incident review is "who changed
-what, when" — and often this file is all that's left.
+other way. The log is append-only, not tamper-evident: anyone who can write the file can
+edit it, so ship it off-box if it is part of a compliance requirement. Set
+`SSHMGR_AUDIT_MAX_BYTES` to rotate to `audit.log.1` when the file grows past that size.
+Why it's worth keeping: the first question in any incident review is "who changed what,
+when" — and often this file is all that's left.
 
 ## Workflow: A Depth Ladder, Used On Demand
 
@@ -151,6 +184,7 @@ run an inspection script.**
 | Site returns 502 | L1 quantify the logs → follow the chain down, `references/troubleshooting.md` |
 | Service is down / restart it | L1 check state → mutating, needs confirmation |
 | How's that host doing | L0 read the profile first; `profile_store check` only if you need current state |
+| Compare several hosts | `profile_store compare -H a,b` (local, no network) |
 | Operate on several hosts | Batch: print the target list, then `batch_run.sh` |
 | Hardening / compliance | `references/hardening.md` |
 
@@ -190,19 +224,33 @@ scripts/profile_store.sh find -H web1          # resolvable by alias, IP, or hos
 scripts/profile_store.sh show -H web1 --short  # the ≤20-line portrait (show this, not 200 raw lines)
 scripts/profile_store.sh list                   # every profile in one table, with latency
 scripts/profile_store.sh check -H web1          # one connection to test whether it rebooted
+scripts/profile_store.sh compare -H web1,web2   # local hardware/service comparison
 ```
 
-- Profiles live in `~/.ssh-server-manager/profiles/<target>.profile`, alongside `audit.log`.
-  They contain IPs, hostnames, image lists and other infrastructure detail — **do not commit
-  them to a repository or paste them somewhere public**.
-- The filename follows the connection target (IP or alias), but the machine's real IP, hostname
-  and alias are all recorded inside, so any of the three finds the same profile.
+`collect` and `check` accept the same password options as `ssh_exec.sh`
+(`--auth`, `--prompt-credential`, `--password-env`, `--credential-file`,
+`--use-saved-credential`, `--save-credential`). They also reuse the stored
+user/port/jump/identity from an existing profile, so a first collect with `-p 2222 -J bastion`
+does not have to repeat those flags on every later refresh.
+
+- Profiles live in `~/.ssh-server-manager/profiles/<target>.profile`, with a `_<port>` suffix
+  for non-default SSH ports (`web1_2222.profile`). They contain IPs, hostnames, image lists
+  and other infrastructure detail — **do not commit them to a repository or paste them
+  somewhere public**. Directories are 700 and files 600 on filesystems that honour modes.
+- The machine's real IP, hostname and alias are all recorded inside, so any of the three finds
+  the same profile. Lookups are exact-line matches; a prefix such as `web1` does not match
+  `web10`. If one host has profiles for several ports, pass `-p` or the lookup refuses to
+  guess.
 - **IPs get recycled, and behind NAT several machines share one egress IP**, so identity is not
-  IP alone: collection compares `machine_id` and the host-key fingerprint, and refuses to
-  overwrite on a mismatch, saving a `.m2.profile` and warning instead.
+  IP alone. The host-key fingerprint from `known_hosts` is the primary judgement; `machine_id`
+  is corroboration. If either changes, collection refuses to overwrite: the new result is
+  saved as a `.m2.profile` and the command exits 3. `--force` overrides only after you have
+  confirmed the machine was reinstalled or replaced.
 - **Profiles hold slow-moving facts only** (model, inventory, disk baseline). Load, free memory,
   connection counts and similar fast-moving state stay in `health_check.sh` and out of the
   profile — otherwise the profile is stale every day, which is the same as not having one.
+- `set -H web1 --note "..."` updates the note; fields maintained by the collector
+  (`machine_id`, `boot_id`, `ssh_*`, timestamps, fingerprints) cannot be edited this way.
 
 ### Refresh Rules
 
@@ -221,12 +269,13 @@ The script does this **automatically** after a successful mutating command. To r
 
 ```bash
 # --sections is a partial refresh: unnamed sections are carried over untouched from the
-# existing profile. Omitting --sections replaces the whole fact set.
+# existing profile, and only the refreshed sections are cleared from stale_sections.
+# Omitting --sections replaces the whole fact set and clears all stale markers.
 scripts/profile_store.sh collect -H web1 --sections docker,services   # re-collect just these
 scripts/profile_store.sh mark-stale -H web1 --sections docker --reason "swapped image"
 ```
 
-If the machine rebooted (`check` tells you), `runtime/services/storage` are invalid while
+If the machine rebooted (`check` tells you), `runtimes/services/storage` are invalid while
 `identity/hw` remain perfectly good — there is no reason to re-read the CPU model because of a
 reboot.
 
@@ -264,7 +313,11 @@ mechanism rather than a good intention.
 
 ## 1. Connection Management
 
-**Resolution order**: inventory alias → `~/.ssh/config` Host alias → `user@host[:port]`.
+**Resolution order**: `batch_run.sh` resolves inventory aliases before calling the wrapper.
+`ssh_exec.sh` passes `-H` to ssh, so `~/.ssh/config` Host aliases and real hostnames work;
+`user@host` is accepted. Use `-p` for a custom port (`host:port` is not parsed by `-H`).
+Scripts use `ssh -G` to resolve the effective hostname, port, user and `known_hosts` entry
+for host-key checks and profile naming, so aliases and non-22 ports are handled correctly.
 
 - Pick the auth method based on what the user has (**a password is enough — no need to
   generate a key first**). Custom port via `-p`, jump host via `-J` (ProxyJump). Pin it in
@@ -325,9 +378,19 @@ scripts/ssh_exec.sh -H web1 -f scripts/health_check.sh -A "--deep --updates" -t 
 Coverage: OS and kernel version, uptime, CPU and load (normalized by core count), memory and
 swap, disk and inode usage (with threshold verdicts), listening ports and connection states,
 failed systemd units, SELinux/AppArmor, firewall state, effective SSH config, recent logins,
-Docker container health. It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs can grep
-directly; thresholds are adjustable per machine role via environment variables such as
-`SSHMGR_DISK_WARN`.
+Docker container health (only Exited/Restarting/unhealthy are flagged; a plain `Up 2 hours`
+container without a healthcheck is normal). It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which
+batch runs can grep directly.
+
+Thresholds can be passed through the wrapper's `-A`:
+
+```bash
+scripts/ssh_exec.sh -H web1 -f scripts/health_check.sh -A "--disk-warn 75 --disk-crit 85 --load-warn 1.5" -t 180
+```
+
+The same values can be set as `SSHMGR_DISK_WARN`, `SSHMGR_INODE_WARN`, `SSHMGR_LOAD_WARN`,
+`SSHMGR_MEM_WARN` (and `_CRIT` variants) when running `health_check.sh` directly on a host.
+Local environment variables are not forwarded by ssh, so use the flags through the wrapper.
 
 **Reading the numbers** (this trips people up more than the commands do):
 
@@ -397,7 +460,8 @@ rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run bef
   `--delete` is a mutating operation — dry-run it first to see the list.
 - **Back up before changing any config file**:
   `scripts/backup_config.sh -H <host> -f /etc/nginx/nginx.conf`. It collects by timestamp,
-  verifies hashes, and prints a restore command you can copy and run.
+  verifies hashes, and prints a restore command with the ssh prefix attached (so it runs from
+  your local machine) plus the matching syntax check.
 - Record the current state before changing permissions (`ls -l`,
   `stat -c '%a %U:%G' <path>`), or you cannot restore it afterwards. `chmod -R` / `chown -R`
   on system directories is dangerous: symlinks get followed, and you can break the execute
@@ -476,10 +540,15 @@ scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y upgrade' --confirm
   succeeded".
 - **Validate a mutating batch on one host before opening it up to all of them.** Add
   `--stop-on-error` to surface "the very first host failed" quickly.
-- With more than 10 targets the script demands an explicit `--yes`, so the "confirm the target
-  list" step cannot be skipped.
+- Any mutating or dangerous batch requires an explicit `--yes`, so the "confirm the target
+  list" step cannot be skipped. Dangerous commands additionally require `--confirm-danger`.
+- Inventory entries may set `auth: auto|key|password`; `--auth` on the command line overrides it
+  for every host.
+- Each run writes to a unique `~/.ssh-server-manager/batch-<UTC>.<random>/` directory, with
+  per-host logs named by index rather than by alias. Aliases are display labels, not file paths.
 - `--parallel 1 --stop-on-error` is the steadier combination for a first mutating run: one host
-  at a time, stopping immediately on a problem.
+  at a time, stopping immediately on a problem. With `--parallel > 1`, up to N already-started
+  hosts will finish even after a failure is detected.
 - A per-host timeout is recorded as a failure rather than "unknown" — review those hosts in the
   report; don't count them as successes.
 
@@ -490,8 +559,8 @@ scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y upgrade' --confirm
 | `scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log | `ssh_exec.sh -H web1 -c 'df -h'` |
 | `scripts/health_check.sh` | One-shot inspection that runs on the remote host, structured output | `ssh_exec.sh -H web1 -f scripts/health_check.sh -t 180` |
 | `scripts/batch_run.sh` | Run across many hosts and summarize (tag filtering, concurrency, failure summary) | `batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime'` |
-| `scripts/backup_config.sh` | Back up before a config change; prints a ready-to-run restore command | `backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |
-| `scripts/profile_store.sh` | Server profiles: collect/find/show/list/check/set/mark-stale/forget (local; use collect on first contact) | `profile_store.sh collect -H web1 -u root` |
+| `scripts/backup_config.sh` | Back up before a config change; prints a restore command with the ssh prefix already attached | `backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |
+| `scripts/profile_store.sh` | Server profiles: collect/find/show/list/check/compare/set/mark-stale/forget (local; use collect on first contact) | `profile_store.sh collect -H web1 -u root` |
 | `scripts/server_profile.sh` | The read-only collector that runs remotely (normally invoked by profile_store) | `ssh_exec.sh -H web1 -f scripts/server_profile.sh -t 120` |
 | `scripts/tcping.sh` | Local TCP handshake latency probe, zero remote load | `tcping.sh -H web1 -p 22 -n 4` |
 
@@ -506,10 +575,12 @@ The read-only scripts bundled with this skill (`health_check.sh`, `server_profil
 exemption applies only to scripts inside this skill's own `scripts/` directory — it cannot be
 used to launder an arbitrary local script.
 
-When you cannot connect or authentication fails, run `ssh_exec.sh --selftest` first. It prints
-the ssh path and version, whether that ssh supports `SSH_ASKPASS_REQUIRE`, whether `/dev/tcp`
-and GNU timeout are available, whether the askpass helper can round-trip a password end to end,
-and whether the machine has a transparent proxy (which corrupts latency measurement).
+When you cannot connect or authentication fails, run `ssh_exec.sh --selftest` first. It does
+not connect or read credentials. It prints the ssh path/version, whether that ssh supports
+`SSH_ASKPASS_REQUIRE`, whether `/dev/tcp` is available, whether GNU timeout or the built-in
+watchdog will be used, which helper tools are present, whether the askpass helper round-trips a
+password end to end, the `ssh -G` resolution of a supplied host, and whether the machine has a
+transparent proxy (which corrupts latency measurement).
 
 ## Reference Documents
 

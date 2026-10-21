@@ -21,8 +21,9 @@
 #   若每次探测都 fork 一次再计时，本机 127.0.0.1（真实 RTT≈0）会测出 ~100 ms，
 #   真实数字被完全淹没。所以这里整批探测只 fork 一次，循环内用 bash 内建变量
 #   EPOCHREALTIME 取微秒、纯整数求差 —— 每次探测额外开销≈0。
-#   bash < 5（如 CentOS 7）没有 EPOCHREALTIME，降级到外部 `date`，会有每次约 24 ms
-#   的固定偏高，输出以 clock=date 标注。
+#   bash < 5（如 macOS 自带 3.2、CentOS 7）没有 EPOCHREALTIME：优先用 GNU date 的
+#   %N，其次 perl Time::HiRes / python3，最后才退到秒级 date。clock=... 字段告诉你
+#   实际用了哪一种；coarse_clock 表示分辨率不足，数值不可信。
 #
 # 不做域名解析：本机 nslookup 输出随系统语言变化（中文 Windows 是"服务器:"），
 # 解析它不可靠；目标机的真实 IP 由 server_profile.sh 在远端采集（ip -br addr），
@@ -38,7 +39,6 @@
 set -uo pipefail
 LC_ALL=C
 
-PROG="$(basename "$0")"
 HOST=""
 PORT=22
 COUNT=4
@@ -71,15 +71,18 @@ done
 
 [ -n "$HOST" ] || { err "必须指定目标主机（-H）"; exit 1; }
 case "$PORT" in ''|*[!0-9]*) err "端口必须是数字"; exit 1 ;; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { err "端口必须在 1-65535 之间"; exit 1; }
 case "$COUNT" in ''|*[!0-9]*) err "探测次数必须是数字"; exit 1 ;; esac
 [ "$COUNT" -ge 1 ] || { err "探测次数至少为 1"; exit 1; }
 [ "$COUNT" -le 20 ] || { err "探测次数最多 20（再多也只是给对端添麻烦）"; exit 1; }
+case "$GAP" in ''|*[!0-9.]*|*.*.*) err "间隔必须是数字（秒）"; exit 1 ;; esac
 
 if [ -z "$TOTAL_TIMEOUT" ]; then
   TOTAL_TIMEOUT=$(( COUNT * 3 + 3 ))
   [ "$TOTAL_TIMEOUT" -gt 30 ] && TOTAL_TIMEOUT=30
 fi
 case "$TOTAL_TIMEOUT" in ''|*[!0-9]*) err "超时必须是整数秒"; exit 1 ;; esac
+[ "$TOTAL_TIMEOUT" -ge 1 ] || { err "超时至少为 1 秒"; exit 1; }
 
 # 优先用 GNU coreutils 的 timeout。Windows/Git-Bash 下 `timeout` 可能解析到
 # Windows 自带 timeout.exe（等待按键，语义完全不同），用 --version 探测避开。
@@ -90,26 +93,51 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 fi
 
+# ---------- 时钟选择 ----------
+# EPOCHREALTIME 只有 bash 5 有；GNU date 支持 %N，BSD/macOS 的 date 不支持。
+# 依次退到 perl Time::HiRes（macOS 自带）和 python3，避免在 macOS 上把延迟算成 0。
+if [ -n "${EPOCHREALTIME:-}" ]; then
+  CLOCK="realtime"
+elif _n="$(date +%s%N 2>/dev/null)" && case "$_n" in ''|*[!0-9]*) false ;; *) true ;; esac; then
+  CLOCK="gnu"
+elif command -v perl >/dev/null 2>&1 && perl -MTime::HiRes=time -e '1' >/dev/null 2>&1; then
+  CLOCK="perl"
+elif command -v python3 >/dev/null 2>&1; then
+  CLOCK="python"
+else
+  CLOCK="seconds"
+  RELIABLE=0
+  REASON="coarse_clock"
+fi
+
 # ---------- 探测内核 ----------
 # 在子 shell 里跑，整批只 fork 这一次。参数经 '_' 之后的 $1.. 传入。
 INNER='
-H=$1; P=$2; N=$3; GAP=$4
+H=$1; P=$2; N=$3; GAP=$4; CLOCK=$5
+now_us() {
+  local v
+  case "$CLOCK" in
+    realtime)
+      v=${EPOCHREALTIME/./}
+      while [ ${#v} -lt 16 ]; do v="${v}0"; done
+      printf "%s" "$v" ;;
+    gnu)
+      v=$(date +%s%N 2>/dev/null); printf "%s" "${v%???}" ;;
+    perl)
+      perl -MTime::HiRes=time -e "printf q{%.0f}, time*1000000" 2>/dev/null ;;
+    python)
+      python3 -c "import time; print(int(time.time()*1000000))" 2>/dev/null ;;
+    *)
+      printf "%s" "$(( $(date +%s) * 1000000 ))" ;;
+  esac
+}
 for ((i=0;i<N;i++)); do
-  if [ -n "${EPOCHREALTIME:-}" ]; then
-    s=${EPOCHREALTIME/./}
-    while [ ${#s} -lt 16 ]; do s="${s}0"; done
-  else
-    s=$(date +%s%N); s=${s%???}
-  fi
+  s=$(now_us)
   if exec 3<>"/dev/tcp/$H/$P" 2>/dev/null; then
-    if [ -n "${EPOCHREALTIME:-}" ]; then
-      e=${EPOCHREALTIME/./}
-      while [ ${#e} -lt 16 ]; do e="${e}0"; done
-    else
-      e=$(date +%s%N); e=${e%???}
-    fi
+    e=$(now_us)
     exec 3<&- 2>/dev/null
     exec 3>&- 2>/dev/null
+    [ -n "$s" ] && [ -n "$e" ] || { printf "FAIL 0\n"; continue; }
     printf "OK %d\n" "$(( (e-s)/1000 ))"
   else
     printf "FAIL 0\n"
@@ -118,20 +146,20 @@ for ((i=0;i<N;i++)); do
 done
 '
 
-probe() { # host port count gap deadline -> "OK ms" / "FAIL 0" 每行
+probe() { # host port count gap deadline clock -> "OK ms" / "FAIL 0" 每行
   if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$5" bash -c "$INNER" _ "$1" "$2" "$3" "$4" 2>/dev/null
+    "$TIMEOUT_BIN" "$5" bash -c "$INNER" _ "$1" "$2" "$3" "$4" "$6" 2>/dev/null
   else
-    bash -c "$INNER" _ "$1" "$2" "$3" "$4" 2>/dev/null
+    bash -c "$INNER" _ "$1" "$2" "$3" "$4" "$6" 2>/dev/null
   fi
 }
 
 # ---------- 对照探测：本机是否在透明代理所有 TCP ----------
 # 192.0.2.1/24 是 RFC 5737 的 TEST-NET-1，保留给文档用，正常网络绝不可能连上。
 # 若能连上，只可能是本机栈（TUN 代理 / 杀软 / 企业网关）替你接了。
-RELIABLE=1
-REASON=""
-CONTROL="$(probe 192.0.2.1 9 1 0 2)"
+RELIABLE="${RELIABLE:-1}"
+REASON="${REASON:-}"
+CONTROL="$(probe 192.0.2.1 9 1 0 2 "$CLOCK")"
 case "$CONTROL" in
   OK*)
     RELIABLE=0
@@ -145,7 +173,7 @@ esac
 
 # ---------- 正式探测 ----------
 note "${C_DIM}-> tcping ${HOST}:${PORT}  探测 ${COUNT} 次${C_OFF}"
-RAW="$(probe "$HOST" "$PORT" "$COUNT" "$GAP" "$TOTAL_TIMEOUT")"
+RAW="$(probe "$HOST" "$PORT" "$COUNT" "$GAP" "$TOTAL_TIMEOUT" "$CLOCK")"
 
 OK=0; REFUSED=0; MIN=""; MAX=""; SUM=0; n=0
 while IFS=' ' read -r st ms; do
@@ -170,7 +198,6 @@ NOANSWER=$(( COUNT - n ))
 [ "$NOANSWER" -lt 0 ] && NOANSWER=0
 LOST=$(( REFUSED + NOANSWER ))
 
-if [ -n "${EPOCHREALTIME:-}" ]; then CLOCK="realtime"; else CLOCK="date"; fi
 SUFFIX="clock=${CLOCK} reliable=${RELIABLE}"
 [ -n "$REASON" ] && SUFFIX="${SUFFIX} reason=${REASON}"
 

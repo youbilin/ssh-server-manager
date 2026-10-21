@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Offline stand-in for ssh-keyscan. Emits a fixture key list.
+set -uo pipefail
+
+if [ -n "${FAKE_KEYSCAN_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_KEYSCAN_LOG"
+fi
+if [ -n "${FAKE_KEYSCAN_OUTPUT:-}" ] && [ -f "$FAKE_KEYSCAN_OUTPUT" ]; then
+  cat "$FAKE_KEYSCAN_OUTPUT"
+fi
+exit "${FAKE_KEYSCAN_RC:-0}"

@@ -11,6 +11,11 @@
 #   ./ssh_exec.sh -H web1 --preflight
 #   ./ssh_exec.sh -H web1 -f ./health_check.sh -t 180      # 本地脚本经 stdin 交给远端 bash
 #   ./ssh_exec.sh -H web1 --dry-run -c 'rm -rf /tmp/x'     # 只看风险判定，不执行
+#   ./ssh_exec.sh -H web1 --show-host-key                  # 只打印指纹，不写入
+#   ./ssh_exec.sh -H web1 --accept-host-key --fingerprint SHA256:xxxx
+#
+# 执行阶段顺序：分级 -> dry-run -> 高危拒绝 -> 自检 -> 主机密钥 -> 认证 -> 预检 -> 执行。
+# dry-run 与自检不会发起网络连接，也不会读取/保存凭据。
 #
 # 退出码: 0 远端成功 | 124 超时 | 4 高危未确认 | 1 用法/本地错误（含密码模式下没拿到口令）
 #        | 2 连接失败或认证失败
@@ -28,6 +33,15 @@ PROG="$(basename "$0")"
 # 以及校验"只读脚本声明"是否来自本 skill 自己的 scripts/。
 SCRIPT_DIR_SELF="$(cd "$(dirname "$0")" && pwd)"
 
+if [ ! -r "$SCRIPT_DIR_SELF/lib/risk.sh" ] || [ ! -r "$SCRIPT_DIR_SELF/lib/target.sh" ]; then
+  printf '[error] 安装不完整：缺少 scripts/lib/risk.sh 或 scripts/lib/target.sh\n' >&2
+  exit 1
+fi
+# shellcheck source=lib/risk.sh
+. "$SCRIPT_DIR_SELF/lib/risk.sh"
+# shellcheck source=lib/target.sh
+. "$SCRIPT_DIR_SELF/lib/target.sh"
+
 HOST=""
 USER_NAME=""
 PORT=""
@@ -42,8 +56,10 @@ CONNECT_TIMEOUT=8
 PREFLIGHT=0
 CONFIRM_DANGER=0
 ACCEPT_HOST_KEY=0
+SHOW_HOST_KEY=0
 FINGERPRINT=""
 DRY_RUN=0
+PRINT_TIER=0
 DO_LOG=1
 QUIET=0
 LOG_LABEL=""
@@ -55,10 +71,12 @@ PASSWORD_ENV=""           # --password-env VAR
 CREDENTIAL_FILE="${SSHMGR_CREDENTIAL_FILE:-}"   # 显式指定
 CONFIRM_CRED_FILE=""      # --credential-file F
 SAVE_CREDENTIAL=0
+USE_SAVED_CREDENTIAL=0
 PROMPT_CREDENTIAL=0
 PASSWORD=""               # 只在内存里；永不进命令行、日志、档案
-USED_AUTH=""              # key | password，用于审计与诊断
-ASKPASS_HELPER=""         # 临时 helper 路径，由 cleanup 删
+ASKPASS_HELPER=""         # 临时 helper 路径
+PW_TMPFILE=""
+TMP_FILES=()              # 所有临时文件统一登记，cleanup 逐个删除
 
 # SSHMGR_HOME 与 profile_store.sh 保持一致：两个脚本必须认同一个家目录，
 # 否则档案在一处、审计日志和凭据在另一处，排查时会找不到东西。
@@ -82,21 +100,31 @@ dim()  { [ "$QUIET" -eq 1 ] || printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 hint() { [ "$QUIET" -eq 1 ] || printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
 
 # ---------- 统一清理 ----------
-# ⚠ bash 的 `trap ... EXIT` 是**替换**而不是追加。原脚本在末尾 `trap 'rm -f "$out_file"' EXIT`，
-# 若清理口令临时文件的 trap 注册得更早，会被这一句直接顶掉 —— 口令文件就留在磁盘上了。
-# 所以全脚本只装这一个 EXIT trap，所有要清理的东西都登记在这里。
+# ⚠ bash 的 `trap ... EXIT` 是**替换**而不是追加。全脚本只装一个 EXIT trap，
+# 所有要清理的东西都登记在 TMP_FILES 里；否则后注册的 trap 会把前一个顶掉，
+# 密码临时文件就会留在磁盘上。
 OUT_FILE=""
+WATCHDOG_PID=""
 cleanup() {
+  local f
+  [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null
+  if [ "${#TMP_FILES[@]}" -gt 0 ]; then
+    for f in "${TMP_FILES[@]}"; do
+      [ -n "${f:-}" ] && rm -f "$f" 2>/dev/null
+    done
+  fi
   [ -n "${OUT_FILE:-}" ] && rm -f "$OUT_FILE" 2>/dev/null
   [ -n "${ASKPASS_HELPER:-}" ] && rm -f "$ASKPASS_HELPER" 2>/dev/null
   [ -n "${PW_TMPFILE:-}" ] && rm -f "$PW_TMPFILE" 2>/dev/null
-  export PASSWORD=""
+  PASSWORD=""
   return 0
 }
-trap cleanup EXIT INT TERM HUP
+on_signal() { cleanup; exit 130; }
+trap cleanup EXIT
+trap on_signal INT TERM HUP
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'USAGE'
 
 选项:
@@ -114,16 +142,19 @@ usage() {
       --no-preflight     跳过连通性预检直接执行（省一次连接与认证；
                          密码登录时尤其值得用，因为默认会把口令提交两遍）
       --confirm-danger   声明已就高危命令向用户二次确认（否则拒绝执行）
+      --dry-run          只打印将执行的命令与风险等级，不执行；不连接、不读口令
+      --print-tier       只输出风险等级数字（0/1/2），不连接、不需要 -H
       --accept-host-key  首次连接时把远端指纹写入 known_hosts（须先人工核对指纹）
-      --fingerprint FP   配合 --accept-host-key：只有扫描到的指纹与这个值一致才写入。
-                         把"核对指纹"从口头承诺变成机制（不一致直接拒绝）
-      --dry-run          只打印将执行的命令与风险等级，不执行
+                         单独使用即可，不必同时给 -c；写入前必须提供 --fingerprint
+      --show-host-key    只扫描并打印候选指纹，不写入 known_hosts
+      --fingerprint FP   配合 --accept-host-key：只有扫描到的指纹与这个值**完全一致**
+                         才写入，且只写入匹配的那一条密钥
       --no-log           不写审计日志（默认写入，用于事故复盘）
   -q, --quiet            只输出远端原始内容，不带装饰（供其他脚本调用）
       --label TEXT       审计日志里记录的操作说明，替代原始命令
                          （脚本模式或包装脚本用它，事后复盘才看得懂日志）
       --selftest         自检：打印 ssh 路径/版本、askpass 支持、/dev/tcp、
-                         GNU timeout、ControlMaster 是否可用。连不上时先跑这个
+                         GNU timeout/内置看门狗、连接复用目录。连不上时先跑这个
   -h, --help             显示本帮助
 
 认证（密码与密钥是平等的两条路，给什么用什么，不强推密钥）:
@@ -133,6 +164,8 @@ usage() {
       --password-env VAR 从环境变量 VAR 读口令（不进命令行）
       --credential-file F 从文件读口令（建议 0600；会剥掉行尾 CR）
       --prompt-credential 交互式输入口令（read -s，不进 shell history）
+      --use-saved-credential
+                         读取 ~/.ssh-server-manager/credentials（配合 --save-credential）
       --save-credential  把本次口令存到 ~/.ssh-server-manager/credentials（0600）。
                          默认**不**保存；只有你明确要免密时才加这个参数
 
@@ -147,6 +180,7 @@ usage() {
   SSHMGR_ASKPASS_DEBUG=1  把 askpass 收到的 prompt 记到 askpass.log（绝不记口令），
                           用于排查"口令为什么没发出去"
   SSHMGR_NO_MUX=1         关闭连接复用（默认开 ControlMaster，10 分钟内只认证一次）
+  SSHMGR_AUDIT_MAX_BYTES  审计日志超过该字节数时轮转为 audit.log.1（默认关闭）
 USAGE
 }
 
@@ -169,8 +203,10 @@ while [ $# -gt 0 ]; do
     --no-preflight)    NO_PREFLIGHT=1; shift ;;
     --confirm-danger)  CONFIRM_DANGER=1; shift ;;
     --accept-host-key) ACCEPT_HOST_KEY=1; shift ;;
+    --show-host-key)   SHOW_HOST_KEY=1; shift ;;
     --fingerprint)     need_arg "$1" $#; FINGERPRINT="$2"; shift 2 ;;
     --dry-run)         DRY_RUN=1; shift ;;
+    --print-tier)      PRINT_TIER=1; shift ;;
     --no-log)          DO_LOG=0; shift ;;
     --label)           need_arg "$1" $#; LOG_LABEL="$2"; shift 2 ;;
     --selftest)        SELFTEST=1; shift ;;
@@ -178,6 +214,7 @@ while [ $# -gt 0 ]; do
     --password-env)    need_arg "$1" $#; PASSWORD_ENV="$2"; shift 2 ;;
     --credential-file) need_arg "$1" $#; CONFIRM_CRED_FILE="$2"; shift 2 ;;
     --save-credential) SAVE_CREDENTIAL=1; shift ;;
+    --use-saved-credential) USE_SAVED_CREDENTIAL=1; shift ;;
     --prompt-credential) PROMPT_CREDENTIAL=1; shift ;;
     -q|--quiet)        QUIET=1; shift ;;
     -h|--help)         usage; exit 0 ;;
@@ -189,9 +226,6 @@ while [ $# -gt 0 ]; do
       elif [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ]; then
         # -c/-f 已经给出命令，却还有裸的位置参数：这几乎总是"命令没被引号包住"，
         # 被外层 shell（PowerShell 尤其常见）拆成了多个参数。
-        # 以前这里直接 COMMAND="$*" 覆盖：对 -c 是**改变了要执行的命令**，
-        # 于是风险分级作用在另一个片段上 —— `-H h -c systemctl restart nginx`
-        # 被判成 tier0，而真正跑的是被截断的部分；对 -f 则是把审计日志记成别的命令。
         # 静默改变要执行/要记录的内容比报错危险得多，所以这里直接拒绝。
         err "命令已被 -c/-f 指定，却又收到多余的位置参数: $*"
         err "  -c 的命令必须整体加引号；否则外层 shell 会把它拆成多个参数，"
@@ -205,40 +239,207 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$HOST" ] || { [ "$SELFTEST" -eq 1 ] || { err "必须指定目标主机（-H）"; exit 1; }; }
-if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ] && [ "$SELFTEST" -eq 0 ]; then
-  err "需要 -c '命令'、-f 脚本文件 或 --preflight 之一"; exit 1
-fi
+# ---------- 基础校验 ----------
 case "$AUTH_MODE" in auto|key|password) ;; *) err "--auth 只能是 auto|key|password"; exit 1 ;; esac
-case "${TIMEOUT}${CONNECT_TIMEOUT}" in
-  *[!0-9]*) err "超时必须是整数秒"; exit 1 ;;
-esac
+
+case "$TIMEOUT" in ''|*[!0-9]*) err "超时必须是整数秒"; exit 1 ;; esac
+case "$CONNECT_TIMEOUT" in ''|*[!0-9]*) err "连接超时必须是整数秒"; exit 1 ;; esac
+[ "$TIMEOUT" -ge 1 ] || { err "超时至少为 1 秒"; exit 1; }
+[ "$CONNECT_TIMEOUT" -ge 1 ] || { err "连接超时至少为 1 秒"; exit 1; }
+
+if [ -n "$PORT" ]; then
+  case "$PORT" in ''|*[!0-9]*) err "端口必须是数字"; exit 1 ;; esac
+  [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { err "端口必须在 1-65535 之间"; exit 1; }
+fi
+
+if [ -n "$FINGERPRINT" ]; then
+  case "$FINGERPRINT" in
+    SHA256:*) ;;
+    *) err "--fingerprint 必须是完整的 SHA256:... 指纹"; exit 1 ;;
+  esac
+fi
+
+if [ "$NO_PREFLIGHT" -eq 1 ] && [ "$PREFLIGHT" -eq 1 ]; then
+  err "--preflight 与 --no-preflight 不能同时使用"; exit 1
+fi
+if [ "$ACCEPT_HOST_KEY" -eq 1 ] && [ "$SHOW_HOST_KEY" -eq 1 ]; then
+  err "--accept-host-key 与 --show-host-key 不能同时使用"; exit 1
+fi
+if [ "$SHOW_HOST_KEY" -eq 1 ] && { [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ] || [ "$PREFLIGHT" -eq 1 ]; }; then
+  err "--show-host-key 只扫描并打印指纹，不能与 -c/-f/--preflight 同时使用"; exit 1
+fi
+if [ -n "$FINGERPRINT" ] && [ "$ACCEPT_HOST_KEY" -eq 0 ] && [ "$SHOW_HOST_KEY" -eq 0 ]; then
+  err "--fingerprint 只能配合 --accept-host-key 或 --show-host-key 使用"; exit 1
+fi
+if [ "$AUTH_MODE" = "key" ] && { [ -n "$PASSWORD_ENV" ] || [ -n "$CONFIRM_CRED_FILE" ] || [ "$PROMPT_CREDENTIAL" -eq 1 ] || [ "$SAVE_CREDENTIAL" -eq 1 ] || [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; }; then
+  err "--auth key 与密码相关选项冲突"; exit 1
+fi
+
+# -H user@host：把 user 拆出来，避免和 -u 叠成 user2@user1@host
+if [ -n "$HOST" ]; then
+  case "$HOST" in
+    *@*)
+      _host_user="${HOST%%@*}"
+      HOST="${HOST#*@}"
+      if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "$_host_user" ]; then
+        err "-H 中的用户 ($_host_user) 与 -u ($USER_NAME) 不一致"; exit 1
+      fi
+      USER_NAME="$_host_user"
+      ;;
+  esac
+  case "$HOST" in
+    -*) err "主机名不能以 - 开头: $HOST"; exit 1 ;;
+    *[[:space:]]*|*"'"*|*'"'*|*';'*|*'$'*|*'`'*|*'|'*|*'&'*|*'<'*|*'>'*) err "主机名包含不安全字符: $HOST"; exit 1 ;;
+  esac
+fi
+
+[ -n "$HOST" ] || {
+  if [ "$SELFTEST" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then :; else
+    err "必须指定目标主机（-H）"; exit 1
+  fi
+}
+if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ] && [ "$SELFTEST" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$ACCEPT_HOST_KEY" -eq 0 ] && [ "$SHOW_HOST_KEY" -eq 0 ]; then
+  err "需要 -c '命令'、-f 脚本文件、--preflight、--accept-host-key 或 --selftest 之一"; exit 1
+fi
 
 if [ -n "$SCRIPT_FILE" ]; then
   [ -f "$SCRIPT_FILE" ] || { err "脚本文件不存在: $SCRIPT_FILE"; exit 1; }
   SCRIPT_FILE="$(cd "$(dirname "$SCRIPT_FILE")" && pwd)/$(basename "$SCRIPT_FILE")"
-  # 脚本自己的选项（如 health_check.sh --deep）走 -A 透传：
-  # "bash -s -- ARGS" 会把 ARGS 作为 $1.. 交给来自 stdin 的脚本
   if [ -n "$SCRIPT_ARGS" ]; then
     REMOTE_SCRIPT_CMD="bash -s -- $SCRIPT_ARGS"
   fi
   [ -n "$COMMAND" ] || COMMAND="$REMOTE_SCRIPT_CMD < $(basename "$SCRIPT_FILE")"
 fi
 
-# ---------- timeout 探测 ----------
-# 优先用 GNU coreutils 的 timeout。注意：Windows / Git-Bash 下 `timeout` 可能解析到
-# Windows 自带的 timeout.exe（等待按键，语义完全不同），因此用 --version 探测避开它。
-# 必须放在认证逻辑之前：下面的 key_auth_possible 会用它。
-# ssh 可执行文件：默认从 PATH 解析，可用 SSHMGR_SSH 覆盖。
-# 为什么要这个开关：Windows 上 PATH 里可能同时有 msys 的 ssh 和 C:\Windows\System32\OpenSSH\ssh.exe。
+# 目标标签要在分级/拒绝/日志之前确定。
+TARGET="$HOST"
+TARGET_LABEL="$HOST"
+if [ -n "$USER_NAME" ]; then
+  TARGET="${USER_NAME}@${HOST}"
+  TARGET_LABEL="$TARGET"
+fi
+
+# ---------- 风险分级 ----------
+READ_ONLY_DECLARED=0
+if [ -n "$SCRIPT_FILE" ]; then
+  # 脚本内容无法从命令行静态判定，默认保守按变更级处理。
+  # 但如果脚本头部自己声明了 `# sshmgr:read-only`，就维持只读 —— 这是必需的：
+  # 采集档案用的 server_profile.sh 是只读脚本，若它被判成变更级，
+  # "变更后标脏档案"的逻辑会把它自己标脏，形成每次采集都自我失效的死循环。
+  # 声明式豁免的信任级别等同于 --confirm-danger，所以要求脚本必须来自
+  # 本 skill 自己的 scripts/ 目录，不能拿它给任意本地脚本洗白。
+  if head -20 "$SCRIPT_FILE" 2>/dev/null | grep -q '#[[:space:]]*sshmgr:read-only'; then
+    if [ "$(cd "$(dirname "$SCRIPT_FILE")" && pwd)" = "$SCRIPT_DIR_SELF" ]; then
+      READ_ONLY_DECLARED=1
+      RISK_TIER=0
+      RISK_REASON="脚本声明 sshmgr:read-only（本 skill 自带脚本，只读）"
+    else
+      RISK_TIER=1
+      RISK_REASON="脚本声明了 sshmgr:read-only，但不在本 skill 的 scripts/ 目录内，不予采信，按变更级处理"
+    fi
+  else
+    RISK_TIER=1
+    RISK_REASON="执行本地脚本 $(basename "$SCRIPT_FILE")，内容未做静态分析，按变更级处理"
+  fi
+else
+  sshmgr_classify "$COMMAND"
+fi
+
+# ---------- 审计日志 ----------
+file_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -c1-12
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -c1-12
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print substr($NF,1,12)}'
+  fi
+}
+
+_log_escape() {
+  printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/|/\\|/g'
+}
+
+log_cmd() {
+  [ "$DO_LOG" -eq 1 ] || return 0
+  local rc="$1" dur="$2" override="${3:-}" what sum max
+  if [ -n "$override" ]; then
+    what="$override"
+  elif [ -n "$LOG_LABEL" ]; then
+    what="$LOG_LABEL"
+  else
+    what="$(printf '%s' "$COMMAND" | tr '\n\r\t' '   ' | cut -c1-500)"
+  fi
+  if [ -n "$SCRIPT_FILE" ]; then
+    sum="$(file_digest "$SCRIPT_FILE")"
+    what="${what:-script:$(basename "$SCRIPT_FILE")} [script $(basename "$SCRIPT_FILE")${sum:+ sha256:$sum}]"
+  fi
+  mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+  chmod 700 "$LOG_DIR" 2>/dev/null || true
+  max="${SSHMGR_AUDIT_MAX_BYTES:-0}"
+  case "$max" in ''|*[!0-9]*) max=0 ;; esac
+  if [ "$max" -gt 0 ] && [ -f "$LOG_FILE" ]; then
+    if [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt "$max" ]; then
+      mv "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+    fi
+  fi
+  if [ ! -e "$LOG_FILE" ]; then
+    ( umask 077; : > "$LOG_FILE" ) 2>/dev/null || return 0
+  fi
+  printf '%s | %s | tier%s | rc=%s | %ss | %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(_log_escape "$TARGET_LABEL")" "$RISK_TIER" "$rc" "$dur" "$(_log_escape "$what")" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# --print-tier：给 batch_run.sh 等调用方一个稳定接口，不再解析中文 dry-run 输出。
+if [ "$PRINT_TIER" -eq 1 ]; then
+  printf '%s\n' "$RISK_TIER"
+  exit 0
+fi
+
+# ---------- --dry-run ----------
+# ⚠ 输出格式有下游依赖：
+#   batch_run.sh 用
+#   sed -n 's/^风险等级  : tier\([0-9]\).*/\1/p'
+#   精确解析这一行。加行可以，改这一行的形状不行。
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "目标      : $TARGET_LABEL"
+  say "风险等级  : tier${RISK_TIER} (${RISK_REASON})"
+  say "超时      : ${TIMEOUT}s (连接 ${CONNECT_TIMEOUT}s)"
+  if [ -n "$SCRIPT_FILE" ]; then
+    say "脚本      : $SCRIPT_FILE  ->  远端 $REMOTE_SCRIPT_CMD"
+  else
+    say "将执行    : $COMMAND"
+  fi
+  if [ "$RISK_TIER" -ge 1 ] && [ "$READ_ONLY_DECLARED" -eq 0 ]; then
+    say "${C_YEL}提示: 变更与高危操作需要先向用户说明影响面与回滚方案。${C_OFF}"
+  fi
+  exit 0
+fi
+
+# ---------- 高危拦截 ----------
+if [ "$RISK_TIER" -eq 2 ] && [ "$CONFIRM_DANGER" -ne 1 ]; then
+  err "该命令被判为高危，已拒绝执行。"
+  say "  判定依据: $RISK_REASON"
+  say "  命令原文: $COMMAND"
+  say ""
+  say "  执行前需要做到："
+  say "    1) 把上面这条确切命令原文给用户看，明确问一次是否执行"
+  say "    2) 说明回退方案（备份在哪、怎么还原、备用登录入口）"
+  say "    3) 用户确认后，加 --confirm-danger 重新调用"
+  log_cmd 4 0
+  exit 4
+fi
+
+# ---------- ssh / timeout 探测 ----------
+# 必须放在认证逻辑之前：key_auth_possible 会用它。
+# Windows 上 PATH 里可能同时有 msys 的 ssh 和 C:\Windows\System32\OpenSSH\ssh.exe。
 # 后者是原生程序，**无法执行 shebang 脚本**，因此 askpass helper 会失败、密码登录用不了。
-# 解析到原生 ssh 时 selftest 会明确报出来。
 SSH_BIN="${SSHMGR_SSH:-ssh}"
 if [ ! -x "$SSH_BIN" ] && ! command -v "$SSH_BIN" >/dev/null 2>&1; then
   err "找不到 ssh 可执行文件: $SSH_BIN（可用 SSHMGR_SSH 指定路径）"
   exit 1
 fi
 
+# 优先用 GNU coreutils 的 timeout。Windows / Git-Bash 下 `timeout` 可能解析到
+# Windows 自带的 timeout.exe（等待按键，语义完全不同），因此用 --version 探测避开它。
 TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1 && timeout --version >/dev/null 2>&1; then
   TIMEOUT_BIN="timeout"
@@ -246,19 +447,37 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 fi
 
-# ═══════════════════ 认证：解析口令 / 决定用密钥还是密码 ═══════════════════
-# 设计要点（每一条都对应一个真实的失败模式）：
-#
-# 1) 绝不主动劝用户改用密钥。给了账号密码就用账号密码。
-# 2) 口令永不进命令行、永不进审计日志。`sshpass -p` 会把口令暴露在 ps 里，禁止使用。
-# 3) **只有真正拿到非空口令时，才放开 BatchMode 与 NumberOfPasswordPrompts。**
-#    OpenSSH 的 read_passphrase 在 askpass 程序退出码非零时返回的是空串
-#    （password 认证调用时没带 RP_ALLOW_EOF），也就是说 askpass 挂掉**不是**让 ssh 放弃，
-#    而是**提交一个空密码**：白烧一次 MaxAuthTries，还在服务器上留下 Failed password 日志
-#    招来 fail2ban。所以拿不到口令就在调用 ssh 之前退出，绝不"让它自己失败"。
-# 4) BatchMode 与 SSH_ASKPASS 必须同时设置、成对出现。两者一旦不一致，就会退化成
-#    在 /dev/tty 上阻塞读，看起来像卡死。
+# 没有 GNU timeout（例如默认 macOS）时的兜底看门狗。返回 124 与 timeout(1) 一致。
+run_limited() { # <seconds> <command...>
+  local secs="$1"; shift
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$secs" "$@"
+    return $?
+  fi
+  local marker pid wd rc
+  marker="$(mktemp "${TMPDIR:-/tmp}/sshmgr-wd.XXXXXX" 2>/dev/null)" || { "$@"; return $?; }
+  "$@" &
+  pid=$!
+  (
+    sleep "$secs" 2>/dev/null || true
+    : > "$marker" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+  ) &
+  wd=$!
+  WATCHDOG_PID="$wd"
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  WATCHDOG_PID=""
+  if [ -s "$marker" ]; then rc=124; fi
+  rm -f "$marker" 2>/dev/null
+  return "$rc"
+}
 
+# ---------- 凭据：读取 / askpass ----------
 read_credential_file() { # $1=路径 -> 打印口令（剥掉行尾 CR/LF）
   [ -r "$1" ] || return 1
   local v
@@ -270,7 +489,8 @@ read_credential_file() { # $1=路径 -> 打印口令（剥掉行尾 CR/LF）
 }
 
 resolve_password() {
-  # 优先级：显式 --password-env > SSHMGR_PASSWORD > --credential-file > 默认凭据文件 > 交互输入
+  # 优先级：--password-env > SSHMGR_PASSWORD > --credential-file > SSHMGR_CREDENTIAL_FILE
+  #         > --use-saved-credential > --prompt-credential
   if [ -n "$PASSWORD_ENV" ]; then
     # 用 bash 的间接展开而不是 eval：变量名里哪怕只有一个分号，eval 就是一次本地
     # 命令执行（`--password-env 'X; rm -rf ~'`）。间接展开只做一次名字解析，不解析值。
@@ -294,6 +514,11 @@ resolve_password() {
     PASSWORD="$(read_credential_file "$CREDENTIAL_FILE")" || true
     [ -n "$PASSWORD" ] && return 0
   fi
+  if [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; then
+    PASSWORD="$(read_credential_file "$CRED_FILE_DEFAULT")" || {
+      err "无法从 $CRED_FILE_DEFAULT 读到口令（先运行一次带 --save-credential 的命令）"; exit 1; }
+    return 0
+  fi
   if [ "$PROMPT_CREDENTIAL" -eq 1 ]; then
     [ -t 0 ] || [ -r /dev/tty ] || { err "--prompt-credential 需要终端"; exit 1; }
     printf '请输入 %s@%s 的密码: ' "${USER_NAME:-${USER:-$(id -un 2>/dev/null || echo user)}}" "$HOST" >&2
@@ -306,13 +531,9 @@ resolve_password() {
   return 1
 }
 
-setup_askpass() {
-  # 用临时文件做 helper：ssh 通过 execlp 执行它，所以必须是可执行的**真实文件**，
-  # 且 stdout 只能打印口令（诊断信息一律走 stderr）。
-  ASKPASS_HELPER="$(mktemp "${TMPDIR:-/tmp}/sshmgr-askpass.XXXXXX")" || return 1
-  PW_TMPFILE="$(mktemp "${TMPDIR:-/tmp}/sshmgr-pw.XXXXXX")" || return 1
-  chmod 700 "$ASKPASS_HELPER" "$PW_TMPFILE" 2>/dev/null || true
-  ( umask 077; printf '%s\n' "$PASSWORD" > "$PW_TMPFILE" ) || return 1
+# 写 askpass helper：ssh 通过 execlp 执行它，所以必须是可执行的**真实文件**，
+# 且 stdout 只能打印口令（诊断信息一律走 stderr）。
+write_askpass_helper() { # $1=helper 路径 $2=口令文件
   {
     printf '#!/bin/sh\n'
     printf '# ssh_exec.sh 的 askpass helper —— 只在密码认证路径下临时存在，退出即删\n'
@@ -323,10 +544,21 @@ setup_askpass() {
     printf '  chmod 600 "%s/askpass.log" 2>/dev/null\n' "$LOG_DIR"
     printf 'fi\n'
     # 口令从文件读，不从环境或命令行读 —— 后者会出现在 ps / /proc/<pid>/environ 里
-    printf 'cat "%s" 2>/dev/null\n' "$PW_TMPFILE"
+    printf 'cat "%s" 2>/dev/null\n' "$2"
     printf 'exit 0\n'
-  } > "$ASKPASS_HELPER" || return 1
-  chmod 700 "$ASKPASS_HELPER" 2>/dev/null || true
+  } > "$1" || return 1
+  chmod 700 "$1" 2>/dev/null || true
+  return 0
+}
+
+setup_askpass() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  ASKPASS_HELPER="$(mktemp "${TMPDIR:-/tmp}/sshmgr-askpass.XXXXXX")" || return 1
+  PW_TMPFILE="$(mktemp "${TMPDIR:-/tmp}/sshmgr-pw.XXXXXX")" || return 1
+  TMP_FILES+=("$ASKPASS_HELPER" "$PW_TMPFILE")
+  chmod 700 "$ASKPASS_HELPER" "$PW_TMPFILE" 2>/dev/null || true
+  ( umask 077; printf '%s\n' "$PASSWORD" > "$PW_TMPFILE" ) || return 1
+  write_askpass_helper "$ASKPASS_HELPER" "$PW_TMPFILE" || return 1
   PASSWORD=""   # 口令已落到 0600 临时文件，变量里不再保留
   return 0
 }
@@ -342,12 +574,238 @@ key_auth_possible() {
   [ -n "$PORT" ] && t+=( -p "$PORT" )
   [ -n "$JUMP" ] && t+=( -J "$JUMP" )
   local target="$HOST"; [ -n "$USER_NAME" ] && target="${USER_NAME}@${HOST}"
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" 12 "$SSH_BIN" "${t[@]}" "$target" true >/dev/null 2>&1
-  else
-    "$SSH_BIN" "${t[@]}" "$target" true >/dev/null 2>&1
-  fi
+  run_limited 12 "$SSH_BIN" "${t[@]}" "$target" true >/dev/null 2>&1
 }
+
+# ---------- --selftest ----------
+# 一屏把"为什么连不上/口令为什么没发出去"能自查的东西全打出来。
+# 这一步发生在认证之前：不读口令、不连目标、不留下任何凭据文件。
+if [ "$SELFTEST" -eq 1 ]; then
+  # 中文标签是双宽字符，printf 的 %-22s 按字节补空格会错位；本脚本 LC_ALL=C，
+  # bash 的 ${#s} 也只数字节。自己算显示列宽：ASCII 1 列，UTF-8 多字节字符 2 列。
+  _sw() {
+    local s="$1" i b w=0
+    for ((i=0; i<${#s}; i++)); do
+      b=$(printf '%d' "'${s:i:1}" 2>/dev/null) || b=63
+      if   [ "$b" -ge 192 ]; then w=$((w+2))
+      elif [ "$b" -ge 128 ]; then :
+      else w=$((w+1))
+      fi
+    done
+    printf '%d' "$w"
+  }
+  ST() { local w pad="" i; w="$(_sw "$1")"; for ((i=w; i<22; i++)); do pad="$pad "; done; printf '%s%s %s\n' "$1" "$pad" "$2"; }
+  printf '%s\n' "═══ ssh-server-manager 自检 ═══"
+  SSHBIN="$SSH_BIN"
+  case "$SSHBIN" in */*) ;; *) SSHBIN="$(command -v "$SSH_BIN" 2>/dev/null || echo "$SSH_BIN")" ;; esac
+  ST "ssh 可执行文件" "$SSHBIN$([ -n "${SSHMGR_SSH:-}" ] && echo "  (来自 SSHMGR_SSH)")"
+  ST "ssh 版本" "$([ -x "$SSHBIN" ] && "$SSHBIN" -V 2>&1 | head -1 || echo '无法执行')"
+  case "$SSHBIN" in
+    /c/Windows/*|*System32*) printf '%-22s %s\n' "注意" "解析到 Windows 原生 ssh —— 它无法执行 shebang 脚本，askpass helper 会失败。建议在 Git-Bash 里跑，或用 SSHMGR_SSH 指定 msys 的 ssh" ;;
+  esac
+  if [ -n "$SSHBIN" ] && [ -r "$SSHBIN" ]; then
+    if grep -qa 'SSH_ASKPASS_REQUIRE' "$SSHBIN" 2>/dev/null; then
+      ST "askpass 支持" "是（二进制含 SSH_ASKPASS_REQUIRE）→ 密码登录可用，无需 sshpass"
+    else
+      ST "askpass 支持" "否 —— 这个 ssh 太老，密码登录会不可靠"
+    fi
+  fi
+  ST "sshpass" "$(command -v sshpass 2>/dev/null || echo '未安装（不影响：本机走 askpass）')"
+  for _c in scp ssh-keygen ssh-keyscan rsync sha256sum shasum openssl; do
+    if command -v "$_c" >/dev/null 2>&1; then
+      ST "工具: $_c" "可用"
+    else
+      case "$_c" in
+        rsync|shasum) ST "工具: $_c" "未安装（可选）" ;;
+        *) ST "工具: $_c" "缺失" ;;
+      esac
+    fi
+  done
+  _dt_err="$( (exec 3<>/dev/tcp/127.0.0.1/1) 2>&1 | head -1 )"
+  case "$_dt_err" in
+    *"No such file or directory"*|*"not supported"*|*"unknown file system"*)
+      ST "/dev/tcp" "不可用（这个 bash 未编译 net redirection）" ;;
+    *"Connection refused"*)
+      ST "/dev/tcp" "可用（连接被拒绝，符合预期）" ;;
+    *)
+      ST "/dev/tcp" "可用（未预期错误: ${_dt_err:-unknown}）" ;;
+  esac
+  ST "GNU timeout" "${TIMEOUT_BIN:-未找到（使用内置 bash 看门狗）}"
+  ST "审计日志目录" "$LOG_DIR"
+  ST "凭据文件" "$CRED_FILE_DEFAULT $([ -f "$CRED_FILE_DEFAULT" ] && echo '(存在)' || echo '(未创建)')"
+  if [ "${SSHMGR_NO_MUX:-0}" = "1" ]; then
+    ST "连接复用" "已通过 SSHMGR_NO_MUX 关闭"
+  elif mkdir -p "$LOG_DIR/cm" 2>/dev/null; then
+    ST "连接复用" "目录可创建（$LOG_DIR/cm；实际复用未验证）"
+  else
+    ST "连接复用" "不可用（$LOG_DIR/cm 建不出来）"
+  fi
+  if [ -n "$HOST" ]; then
+    sshmgr_resolve_target "$SSH_BIN" "$HOST" "$USER_NAME" "$PORT" "$JUMP" "$IDENTITY"
+    ST "解析目标" "host=${SSHMGR_TARGET_HOST} port=${SSHMGR_TARGET_PORT} user=${SSHMGR_TARGET_USER:-?}"
+    ST "known_hosts 条目" "${SSHMGR_TARGET_KH_ENTRY:-?}"
+    [ "$SSHMGR_TARGET_RESOLVED" -eq 1 ] && ST "ssh -G" "解析成功" || ST "ssh -G" "解析失败，使用调用方参数"
+  fi
+  # askpass helper 端到端自测：独立临时文件，绝不碰真实口令。
+  printf '\n生成一个临时 askpass helper 做端到端自测...\n'
+  _saved_pw_test="selftest-$(date +%s)"
+  _sth="$(mktemp "${TMPDIR:-/tmp}/sshmgr-st-askpass.XXXXXX" 2>/dev/null)" || _sth=""
+  _stp="$(mktemp "${TMPDIR:-/tmp}/sshmgr-st-pw.XXXXXX" 2>/dev/null)" || _stp=""
+  if [ -n "$_sth" ] && [ -n "$_stp" ]; then
+    ( umask 077; printf '%s\n' "$_saved_pw_test" > "$_stp" ) 2>/dev/null
+    if write_askpass_helper "$_sth" "$_stp" 2>/dev/null; then
+      got="$("$_sth" "test prompt" 2>/dev/null)"
+      if [ "$got" = "$_saved_pw_test" ]; then
+        ST "askpass 端到端" "通过（helper 能正确回传口令）"
+      else
+        ST "askpass 端到端" "失败：helper 回传了 '${got:0:20}'，与预期不符"
+      fi
+    else
+      ST "askpass 端到端" "失败：helper 建不出来（临时目录不可写？）"
+    fi
+  else
+    ST "askpass 端到端" "失败：临时文件建不出来"
+  fi
+  rm -f "${_sth:-}" "${_stp:-}" 2>/dev/null
+  PASSWORD=""
+  _saved_pw_test=""
+  printf '\n透明代理检查（对照探测保留地址，能连上说明本机栈在拦截流量）：\n'
+  if [ -f "$SCRIPT_DIR_SELF/tcping.sh" ]; then
+    bash "$SCRIPT_DIR_SELF/tcping.sh" -H 192.0.2.1 -p 9 -n 1 -q 2>/dev/null | head -1
+  fi
+  exit 0
+fi
+
+# ---------- 主机密钥 ----------
+# 只写入用户明确给过指纹的那一条密钥。指纹是机制，不是口头承诺。
+handle_host_key() {
+  command -v ssh-keyscan >/dev/null 2>&1 || { err "缺少 ssh-keyscan，无法扫描主机密钥"; exit 2; }
+  command -v ssh-keygen >/dev/null 2>&1 || { err "缺少 ssh-keygen，无法核对指纹"; exit 2; }
+
+  sshmgr_resolve_target "$SSH_BIN" "$HOST" "$USER_NAME" "$PORT" "$JUMP" "$IDENTITY"
+  local scan_host="$SSHMGR_TARGET_HOST"
+  local scan_port="$SSHMGR_TARGET_PORT"
+  if ! sshmgr_target_safe_host "$scan_host"; then
+    err "解析出的主机名包含不安全字符，拒绝拼进扫描命令: $scan_host"; exit 2
+  fi
+  case "$scan_port" in ''|*[!0-9]*) err "解析出的端口不是数字: $scan_port"; exit 2 ;; esac
+  [ "$scan_port" -ge 1 ] && [ "$scan_port" -le 65535 ] || { err "解析出的端口越界: $scan_port"; exit 2; }
+
+  say "${C_YEL}扫描 $scan_host:$scan_port 的主机密钥（ssh-keyscan 本身不提供认证，必须核对指纹）：${C_OFF}"
+  local keys=""
+
+  if [ -n "$SSHMGR_TARGET_JUMP" ]; then
+    # ssh-keyscan 没有 -J；只能从跳板机上去扫目标。跳板机自己的 host key 仍按严格校验，
+    # 所以跳板机必须先被信任，否则这里会在 host key 校验处失败。
+    local remote_cmd
+    remote_cmd="ssh-keyscan -p ${scan_port} -T 5 -t rsa,ecdsa,ed25519 '${scan_host}' 2>/dev/null"
+    keys="$(run_limited 20 "$SSH_BIN" -J "$SSHMGR_TARGET_JUMP" -o ConnectTimeout="$CONNECT_TIMEOUT" \
+      -o BatchMode=yes -o StrictHostKeyChecking=yes "$remote_cmd" 2>/dev/null)"
+  else
+    keys="$(run_limited 20 ssh-keyscan -p "$scan_port" -T 5 -t rsa,ecdsa,ed25519 "$scan_host" 2>/dev/null)"
+  fi
+
+  if [ -z "$keys" ]; then
+    err "未能获取 $scan_host:$scan_port 的主机密钥（网络不通 / sshd 无响应 / 目标只对跳板机可见）"
+    if [ -n "$SSHMGR_TARGET_JUMP" ]; then
+      say "  经跳板机（-J $SSHMGR_TARGET_JUMP）时，跳板机本身也必须已在 known_hosts 中。"
+      say "  先在跳板机上扫描目标并核对："
+      say "    ssh-keyscan -p $scan_port $scan_host 2>/dev/null | ssh-keygen -lf -"
+    fi
+    exit 2
+  fi
+
+  local scanfp
+  scanfp="$(printf '%s\n' "$keys" | ssh-keygen -lf - 2>/dev/null)"
+  if [ -z "$scanfp" ]; then
+    err "ssh-keygen 无法解析扫描结果"; exit 2
+  fi
+  printf '%s\n' "$scanfp" | sed 's/^/  /'
+
+  local match_idx="" matched_key=""
+  if [ -n "$FINGERPRINT" ]; then
+    match_idx="$(printf '%s\n' "$scanfp" | awk -v fp="$FINGERPRINT" '$2==fp {print NR; exit}')"
+    if [ -z "$match_idx" ]; then
+      err "指纹不匹配！扫描到的指纹里没有完整等于 $FINGERPRINT 的值"
+      err "已拒绝继续。这可能是中间人，也可能是你抄错了值 —— 两种情况都别继续。"
+      exit 2
+    fi
+    matched_key="$(printf '%s\n' "$keys" | sed -n "${match_idx}p")"
+    say "${C_GRN}指纹精确匹配（第 ${match_idx} 条），核对通过。${C_OFF}"
+  else
+    printf '\n%s请与云控制台或机房记录逐字符核对。%s\n' "$C_YEL" "$C_OFF"
+    printf '%s--accept-host-key 必须同时提供 --fingerprint；--show-host-key 只查看，不写入。%s\n' "$C_YEL" "$C_OFF"
+  fi
+
+  if [ "$SHOW_HOST_KEY" -eq 1 ]; then
+    if [ -z "$FINGERPRINT" ]; then
+      say "（只查看模式，未写入 known_hosts）"
+    else
+      say "（只查看模式：指纹已核对，但未写入 known_hosts）"
+    fi
+    exit 0
+  fi
+
+  if [ -z "$FINGERPRINT" ]; then
+    err "拒绝写入 known_hosts：没有提供 --fingerprint。"
+    err "请核对上面打印的指纹后重新运行："
+    err "  $PROG -H $HOST --accept-host-key --fingerprint SHA256:..."
+    exit 2
+  fi
+  if [ -z "$SSHMGR_TARGET_KH_FILE" ]; then
+    err "ssh 配置把 UserKnownHostsFile 设为 none；写入默认文件不会生效。"
+    err "请先修正 ssh 配置，或把目标密钥手工加入可信来源。"
+    exit 2
+  fi
+
+  local kh="$SSHMGR_TARGET_KH_FILE" entry="$SSHMGR_TARGET_KH_ENTRY"
+  local oldfp="" oldfps=""
+  if [ -f "$kh" ]; then
+    oldfps="$(ssh-keygen -F "$entry" -f "$kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+  fi
+  if [ -n "$oldfps" ]; then
+    if printf '%s\n' "$oldfps" | grep -Fxq "$FINGERPRINT"; then
+      say "${C_GRN}known_hosts 里已有相同指纹，无需重复写入。${C_OFF}"
+      exit 0
+    fi
+    oldfp="$(printf '%s\n' "$oldfps" | head -1)"
+    err "known_hosts 里 $entry 已存在，但指纹与这次核对的不一致："
+    say "  已有: $oldfp"
+    say "  提供: $FINGERPRINT"
+    say "  这通常意味着目标重装了系统或换了机器，但也可能是中间人。"
+    say "  确认是重装后，先删除旧记录再重试："
+    say "    ssh-keygen -R \"$entry\""
+    exit 2
+  fi
+
+  mkdir -p "$(dirname "$kh")" 2>/dev/null
+  if [ -s "$kh" ] && [ "$(tail -c 1 "$kh" | wc -l)" -eq 0 ]; then
+    printf '\n' >> "$kh"
+  fi
+  printf '%s\n' "$matched_key" >> "$kh"
+  chmod 600 "$kh" 2>/dev/null || true
+  say "${C_GRN}已写入 $kh：$entry ${C_OFF}"
+}
+
+if [ "$ACCEPT_HOST_KEY" -eq 1 ] || [ "$SHOW_HOST_KEY" -eq 1 ]; then
+  handle_host_key
+  # 只接受/只查看时，不执行任何命令，也不做认证。
+  if [ "$SHOW_HOST_KEY" -eq 1 ]; then exit 0; fi
+  if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ]; then exit 0; fi
+fi
+
+# ═══════════════════ 认证：解析口令 / 决定用密钥还是密码 ═══════════════════
+# 设计要点（每一条都对应一个真实的失败模式）：
+#
+# 1) 绝不主动劝用户改用密钥。给了账号密码就用账号密码。
+# 2) 口令永不进命令行、永不进审计日志。`sshpass -p` 会把口令暴露在 ps 里，禁止使用。
+# 3) **只有真正拿到非空口令时，才放开 BatchMode 与 NumberOfPasswordPrompts。**
+#    OpenSSH 的 read_passphrase 在 askpass 程序退出码非零时返回的是空串
+#    （password 认证调用时没带 RP_ALLOW_EOF），也就是说 askpass 挂掉**不是**让 ssh 放弃，
+#    而是**提交一个空密码**：白烧一次 MaxAuthTries，还在服务器上留下 Failed password 日志
+#    招来 fail2ban。所以拿不到口令就在调用 ssh 之前退出，绝不"让它自己失败"。
+# 4) BatchMode 与 SSH_ASKPASS 必须同时设置、成对出现。两者一旦不一致，就会退化成
+#    在 /dev/tty 上阻塞读，看起来像卡死。
 
 AUTH_RESOLVED="key"
 case "$AUTH_MODE" in
@@ -360,14 +818,17 @@ case "$AUTH_MODE" in
       say "  --password-env VAR      从环境变量读（不进命令行）"
       say "  --credential-file F     从文件读（建议 chmod 600）"
       say "  --prompt-credential     交互式输入（不进 shell history）"
-      say "  或设置 SSHMGR_PASSWORD"
+      say "  --use-saved-credential  读取之前 --save-credential 保存的口令"
       exit 1
     }
     AUTH_RESOLVED="password"
     ;;
   auto)
-    # auto：能免密就免密，否则有口令就用口令
-    if key_auth_possible; then
+    # auto：显式要求使用已存凭据时直接走密码；否则能免密就免密
+    if [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; then
+      resolve_password || exit 1
+      AUTH_RESOLVED="password"
+    elif key_auth_possible; then
       AUTH_RESOLVED="key"
     elif resolve_password; then
       AUTH_RESOLVED="password"
@@ -376,12 +837,14 @@ case "$AUTH_MODE" in
     fi
     ;;
 esac
-
 if [ "$AUTH_RESOLVED" = "password" ]; then
   setup_askpass || { err "无法创建 askpass helper（临时目录不可写？）"; exit 1; }
+  # 口令已经写入私有临时文件；从子进程环境里移除来源，减少 /proc/<pid>/environ 暴露。
+  if [ -n "$PASSWORD_ENV" ]; then unset "$PASSWORD_ENV" 2>/dev/null || true; fi
+  unset SSHMGR_PASSWORD 2>/dev/null || true
 fi
 
-# --save-credential：只有用户明确要求才落盘，且必须是 0600
+# --save-credential：只有用户明确要求才落盘，且尽力做到 0600
 if [ "$SAVE_CREDENTIAL" -eq 1 ]; then
   if [ "$AUTH_RESOLVED" != "password" ] || [ -z "${PW_TMPFILE:-}" ]; then
     warn "--save-credential 需要先在本次调用里提供口令，已忽略"
@@ -393,7 +856,7 @@ if [ "$SAVE_CREDENTIAL" -eq 1 ]; then
     _actual="$(stat -c '%a' "$CRED_FILE_DEFAULT" 2>/dev/null)"
     say "${C_GRN}口令已保存到 $CRED_FILE_DEFAULT${C_OFF}"
     if [ "${_actual:-}" = "600" ] || [ "${_actual:-}" = "700" ]; then
-      say "  文件权限已设为 ${_actual}。"
+      say "  文件权限已设为 ${_actual}。之后可用 --use-saved-credential 复用。"
     else
       say "  ${C_YEL}注意：当前文件权限是 ${_actual:-未知}，不是 600 —— Git-Bash 的磁盘挂载通常是"
       say "        noacl，chmod 对权限位是空操作（改不了 Windows ACL）。${C_OFF}"
@@ -403,169 +866,7 @@ if [ "$SAVE_CREDENTIAL" -eq 1 ]; then
   fi
 fi
 
-# ---------- 风险分级 ----------
-# 分级的意义：让「二次确认」成为可执行的门槛，而不是靠记忆和自觉。
-# 短命令加词边界，避免 "kill" 命中 "killer"、"> /etc/" 命中无关路径。
-BOUND='(^|[^[:alnum:]_-])'
-END='([^[:alnum:]_-]|$)'
-
-TIER2_PATTERNS=(
-  "${BOUND}rm[[:space:]]+-[^[:space:]]*[rf]"
-  "${BOUND}dd[[:space:]]"
-  "${BOUND}(mkfs|mkswap|wipefs)"
-  "${BOUND}(sfdisk|fdisk|parted|gdisk)"
-  ':\(\)[[:space:]]*\{'
-  "${BOUND}(shutdown|reboot|halt|poweroff)(${END})"
-  "${BOUND}init[[:space:]]+[06](${END})"
-  "${BOUND}ip6?tables[[:space:]]+(-F|-X)"
-  "${BOUND}ip6?tables[[:space:]]+-P[[:space:]]+[A-Za-z]+[[:space:]]+DROP"
-  "${BOUND}ufw[[:space:]]+.*(disable|reset)"
-  'firewall-cmd.*(--set-default-zone|--panic-on)'
-  "${BOUND}systemctl[[:space:]]+(stop|disable|mask)[[:space:]]+(ssh|sshd)"
-  "${BOUND}service[[:space:]]+ssh(d)?[[:space:]]+stop"
-  'sshd_config|/etc/sudoers|/etc/ssh/ssh_config'
-  '/etc/fstab'
-  '(DROP|TRUNCATE)[[:space:]]+(DATABASE|TABLE)'
-  "${BOUND}kill[[:space:]]+-9[[:space:]]+-?1([^[:alnum:]_-]|$)"
-  "${BOUND}killall5(${END})"
-  "${BOUND}chmod[[:space:]]+-R[[:space:]]+777"
-  "${BOUND}chown[[:space:]]+-R[[:space:]]+[^[:space:]]+[[:space:]]+/(etc|var|usr|bin|sbin|lib|boot)"
-  "${BOUND}userdel[[:space:]]"
-  '(curl|wget)[^|]*\|[[:space:]]*(ba|z)?sh'
-  "${BOUND}mv[[:space:]]+[^[:space:]]+[[:space:]]+/etc/(nginx|ssh|sysconfig)"
-  "${BOUND}sed[[:space:]]+-i.*(sshd_config|fstab|sudoers)"
-  '>[[:space:]]*/dev/(sd|nvme|vd)'
-  # 压测 / 基准测试：本技能默认不跑性能测试。
-  # 在生产机上跑这些既污染业务指标、又可能触发监控告警，结论对运维决策也没有用。
-  # 模式要收紧（都要求后面跟东西），免得误伤 df -h、openssl s_client 这类正常命令。
-  "${BOUND}(sysbench|stress-ng|stress|memtester|bonnie\+\+|unixbench|phoronix-test-suite)[[:space:]]"
-  "${BOUND}fio[[:space:]]"
-  "${BOUND}iperf3?[[:space:]]"
-  "${BOUND}openssl[[:space:]]+speed"
-  "${BOUND}dd[[:space:]]+if=.*[[:space:]]+of="
-  "${BOUND}(hdparm|iozone|dbench|tiobench)[[:space:]]"
-)
-
-TIER1_PATTERNS=(
-  "${BOUND}systemctl.*[[:space:]](start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload)([^[:alnum:]_-]|$)"
-  "${BOUND}service[[:space:]]+[^[:space:]]+[[:space:]]+(start|stop|restart|reload)"
-  "${BOUND}nginx[[:space:]]+-s[[:space:]]+(reload|stop|quit)"
-  "${BOUND}(kill|pkill|killall)[[:space:]]"
-  "${BOUND}apt(-get)?.*[[:space:]](install|remove|purge|upgrade|dist-upgrade|full-upgrade|autoremove)([^[:alnum:]_-]|$)"
-  "${BOUND}(yum|dnf).*[[:space:]](install|remove|erase|update|upgrade|autoremove|groupinstall)([^[:alnum:]_-]|$)"
-  "${BOUND}docker[[:space:]]+(stop|start|restart|rm|rmi|kill|prune|tag)"
-  "${BOUND}docker[[:space:]]+compose.*[[:space:]](up|down|restart|stop|rm|build)([^[:alnum:]_-]|$)"
-  "${BOUND}docker[[:space:]]+system[[:space:]]+prune"
-  "${BOUND}git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(pull|reset|checkout|clean|merge|rebase|stash)"
-  "${BOUND}(chmod|chown|chgrp)[[:space:]]"
-  "${BOUND}sed[[:space:]]+-i"
-  "${BOUND}crontab[[:space:]]+-[re]"
-  "${BOUND}(useradd|usermod|groupadd|groupmod|gpasswd|userdel)"
-  "${BOUND}ufw[[:space:]]+(allow|delete|deny|enable|limit)"
-  'firewall-cmd.*(--add|--remove|--reload)'
-  "${BOUND}sysctl[[:space:]]+-w"
-  "${BOUND}pip[0-9]?[[:space:]]+install"
-  "${BOUND}npm[[:space:]]+install[[:space:]]+-g"
-  "${BOUND}rsync.*--delete"
-  "${BOUND}mv[[:space:]]"
-  "${BOUND}truncate[[:space:]]"
-  "${BOUND}find[^|]*-delete"
-  '>[[:space:]]*/etc/'
-)
-
-RISK_TIER=0
-RISK_REASON=""
-
-classify() {
-  local cmd="$1" pat
-  RISK_TIER=0
-  RISK_REASON="未命中危险模式，按只读处理"
-  for pat in "${TIER2_PATTERNS[@]}"; do
-    if printf '%s' "$cmd" | grep -Eiq -- "$pat"; then
-      RISK_TIER=2
-      case "$pat" in
-        *sysbench*) RISK_REASON="压测/基准类命令：本技能默认不跑性能测试" ;;
-        *)          RISK_REASON="命中高危模式: $pat" ;;
-      esac
-      return 0
-    fi
-  done
-  for pat in "${TIER1_PATTERNS[@]}"; do
-    if printf '%s' "$cmd" | grep -Eiq -- "$pat"; then
-      RISK_TIER=1
-      RISK_REASON="命中变更模式: $pat"
-      return 0
-    fi
-  done
-}
-
-classify "$COMMAND"
-READ_ONLY_DECLARED=0
-if [ -n "$SCRIPT_FILE" ]; then
-  # 脚本内容无法从命令行静态判定，默认保守按变更级处理。
-  # 但如果脚本头部自己声明了 `# sshmgr:read-only`，就维持只读 —— 这是必需的：
-  # 采集档案用的 server_profile.sh 是只读脚本，若它被判成变更级，
-  # "变更后标脏档案"的逻辑会把它自己标脏，形成每次采集都自我失效的死循环。
-  # 声明式豁免的信任级别等同于 --confirm-danger，所以要求脚本必须来自
-  # 本 skill 自己的 scripts/ 目录，不能拿它给任意本地脚本洗白。
-  if head -20 "$SCRIPT_FILE" 2>/dev/null | grep -q '#[[:space:]]*sshmgr:read-only'; then
-    if [ "$(cd "$(dirname "$SCRIPT_FILE")" && pwd)" = "$SCRIPT_DIR_SELF" ]; then
-      READ_ONLY_DECLARED=1
-      RISK_TIER=0
-      RISK_REASON="脚本声明 sshmgr:read-only（本 skill 自带脚本，只读）"
-    else
-      RISK_TIER=1
-      RISK_REASON="脚本声明了 sshmgr:read-only，但不在本 skill 的 scripts/ 目录内，不予采信，按变更级处理"
-    fi
-  else
-    RISK_TIER=1
-    RISK_REASON="执行本地脚本 $(basename "$SCRIPT_FILE")，内容未做静态分析，按变更级处理"
-  fi
-fi
-
-# ---------- 审计日志 ----------
-# 日志要能回答"谁在什么时候改了什么"。脚本模式下命令原文没有意义（只是个临时文件名），
-# 所以记「标签 + 脚本摘要」：摘要能唯一标识当时执行的脚本内容。
-file_digest() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -c1-12
-  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -c1-12
-  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print substr($NF,1,12)}'
-  fi
-}
-
-log_cmd() {
-  [ "$DO_LOG" -eq 1 ] || return 0
-  # $3 可选：覆盖记录内容，用来记下"认证失败 vs 网络不可达"这类命令原文表达不出的判定
-  local rc="$1" dur="$2" override="${3:-}" what sum
-  if [ -n "$override" ]; then
-    what="$override"
-  elif [ -n "$LOG_LABEL" ]; then
-    what="$LOG_LABEL"
-  else
-    what="$(printf '%s' "$COMMAND" | tr '\n\r\t' '   ' | cut -c1-500)"
-  fi
-  if [ -n "$SCRIPT_FILE" ]; then
-    sum="$(file_digest "$SCRIPT_FILE")"
-    what="${what:-script:$(basename "$SCRIPT_FILE")} [script $(basename "$SCRIPT_FILE")${sum:+ sha256:$sum}]"
-  fi
-  mkdir -p "$LOG_DIR" 2>/dev/null || return 0
-  chmod 700 "$LOG_DIR" 2>/dev/null || true
-  if [ ! -e "$LOG_FILE" ]; then
-    ( umask 077; : > "$LOG_FILE" ) 2>/dev/null || return 0
-  fi
-  printf '%s | %s | tier%s | rc=%s | %ss | %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TARGET_LABEL" "$RISK_TIER" "$rc" "$dur" "$what" \
-    >> "$LOG_FILE" 2>/dev/null || true
-}
-
-# ---------- 远端目标 ----------
-TARGET_LABEL="$HOST"
-TARGET="$HOST"
-if [ -n "$USER_NAME" ]; then
-  TARGET="${USER_NAME}@${HOST}"
-  TARGET_LABEL="$TARGET"
-fi
-
+# ---------- SSH 选项 ----------
 SSH_OPTS=(
   -o "ConnectTimeout=${CONNECT_TIMEOUT}"
   -o ServerAliveInterval=15
@@ -587,7 +888,7 @@ if [ "$AUTH_RESOLVED" = "password" ]; then
   export SSH_ASKPASS_REQUIRE=force
   export DISPLAY="${DISPLAY:-:0}"
 else
-  # 密钥路径：与改动前逐字一致。BatchMode 让认证失败立即报错而不是挂起等输入。
+  # 密钥路径：BatchMode 让认证失败立即报错而不是挂起等输入。
   SSH_OPTS+=( -o BatchMode=yes -o "NumberOfPasswordPrompts=0" )
 fi
 
@@ -606,15 +907,6 @@ if [ "${SSHMGR_NO_MUX:-0}" != "1" ]; then
   fi
 fi
 
-# 优先用 GNU coreutils 的 timeout。注意：Windows / Git-Bash 下 `timeout` 可能解析到
-# Windows 自带的 timeout.exe（等待按键，语义完全不同），因此用 --version 探测避开它。
-TIMEOUT_BIN=""
-if command -v timeout >/dev/null 2>&1 && timeout --version >/dev/null 2>&1; then
-  TIMEOUT_BIN="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then
-  TIMEOUT_BIN="gtimeout"
-fi
-
 # ---------- 错误诊断 ----------
 # 把 ssh 的报错翻译成「下一步该做什么」，避免在错误方向上反复重试。
 diagnose() {
@@ -623,9 +915,10 @@ diagnose() {
     *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
       err "主机密钥校验失败 —— 目标不在 known_hosts 中，或指纹已变更。"
       say "  1) 先核对指纹（别跳过，指纹不符可能意味着中间人）："
-      say "     ssh-keyscan -t ed25519,rsa ${PORT:+-p $PORT }$HOST 2>/dev/null | ssh-keygen -lf -"
-      say "  2) 与云控制台或机房记录比对一致后，再加 --accept-host-key 写入 known_hosts"
-      say "  3) 若确认是重装系统导致变更: ssh-keygen -R $HOST 后重新核对" ;;
+      say "     $PROG -H $HOST --show-host-key"
+      say "  2) 与云控制台或机房记录比对一致后，再加 --fingerprint 写入 known_hosts："
+      say "     $PROG -H $HOST --accept-host-key --fingerprint SHA256:..."
+      say "  3) 若确认是重装系统导致变更: ssh-keygen -R \"$HOST\" 后重新核对" ;;
     *"Connection refused"*)
       err "连接被拒绝 —— 主机可达，但该端口没有服务在监听。"
       say "  排查：sshd 是否在运行、端口是否被改（sshd_config 的 Port）、安全组与防火墙是否放行" ;;
@@ -643,7 +936,7 @@ diagnose() {
       say "  密钥路径：-i <私钥>，确认 ssh-agent 已加载、远端 authorized_keys 权限正确"
       say "            （远端要求 ~/.ssh 为 700、authorized_keys 为 600、家目录不能 group-writable）"
       say "  密码路径：--prompt-credential（交互输入，不进 history）"
-      say "            或 --password-env VAR / --credential-file F" ;;
+      say "            或 --password-env VAR / --credential-file F / --use-saved-credential" ;;
     *"Permission denied (password"*|*"Permission denied (keyboard-interactive"*)
       err "密码认证被拒绝 —— 服务端在要密码，但这次提交的口令不对（或口令没送到）。"
       say "  1) 确认账号/口令无误；注意别让文件里的行尾 CR 混进口令"
@@ -684,217 +977,19 @@ diagnose() {
   esac
 }
 
-# ---------- --accept-host-key ----------
-# 只在用户明确要求时写 known_hosts，并且强制打印指纹供人工核对，
-# 这样"首次连接"不会退化成无脑信任。
-if [ "$ACCEPT_HOST_KEY" -eq 1 ]; then
-  command -v ssh-keyscan >/dev/null 2>&1 || { err "缺少 ssh-keyscan，无法写入 known_hosts"; exit 1; }
-  say "${C_YEL}即将把以下主机指纹写入 ~/.ssh/known_hosts，请先与可信来源核对：${C_OFF}"
-  # 取主机密钥。注意 ssh-keyscan **没有 -J 选项**（OpenSSH 9.x 直接报
-  # `unknown option -- J`），以前经跳板机时把它塞给 ssh-keyscan，结果是必然取不到指纹。
-  # 正确做法：开一条到跳板机的 ssh 会话，由跳板机去扫目标（跳板机能看见目标）。
-  # HOST 会被拼进远端命令串里，所以先拒绝带引号/空白的值 —— 主机名本来不该有这些字符。
-  case "$HOST" in
-    *"'"*|*'"'*|*' '*|*';'*|*'$'*|*'`'*)
-      err "主机名包含不安全字符，拒绝拼进远端命令: $HOST"; exit 2 ;;
-  esac
-  keys=""
-  kscan_tmp="$(mktemp "${TMPDIR:-/tmp}/sshmgr-kscan.XXXXXX" 2>/dev/null)" || kscan_tmp=""
-  if [ -n "$JUMP" ]; then
-    if [ -n "$kscan_tmp" ]; then
-      # 跳板机本身仍按严格校验（StrictHostKeyChecking=yes），不做 accept-new：
-      # 这里是为了降低一个风险，而不是引入新的自动信任。
-      if [ -n "$TIMEOUT_BIN" ]; then
-        "$TIMEOUT_BIN" 20 "$SSH_BIN" -J "$JUMP" -o ConnectTimeout="$CONNECT_TIMEOUT"           -o BatchMode=yes -o StrictHostKeyChecking=yes           "ssh-keyscan -p ${PORT:-22} -T 5 -t rsa,ecdsa,ed25519 $HOST 2>/dev/null"           > "$kscan_tmp" 2>/dev/null
-      else
-        "$SSH_BIN" -J "$JUMP" -o ConnectTimeout="$CONNECT_TIMEOUT"           -o BatchMode=yes -o StrictHostKeyChecking=yes           "ssh-keyscan -p ${PORT:-22} -T 5 -t rsa,ecdsa,ed25519 $HOST 2>/dev/null"           > "$kscan_tmp" 2>/dev/null
-      fi
-      keys="$(cat "$kscan_tmp" 2>/dev/null)"
-    fi
-  elif [ -n "$TIMEOUT_BIN" ]; then
-    keys="$("$TIMEOUT_BIN" 20 ssh-keyscan ${PORT:+-p "$PORT"} -T 5 -t rsa,ecdsa,ed25519 "$HOST" 2>/dev/null)"
-  else
-    keys="$(ssh-keyscan ${PORT:+-p "$PORT"} -T 5 -t rsa,ecdsa,ed25519 "$HOST" 2>/dev/null)"
-  fi
-  [ -n "$kscan_tmp" ] && rm -f "$kscan_tmp" 2>/dev/null
-  if [ -z "$keys" ]; then
-    err "未能获取 $HOST 的主机密钥（网络不通 / sshd 无响应 / 目标只对跳板机可见）"
-    if [ -n "$JUMP" ]; then
-      say "  经跳板机（-J $JUMP）时，可以在跳板机上手工扫描："
-      say "    ssh-keyscan -p ${PORT:-22} $HOST | ssh-keygen -lf -"
-      say "  人工核对后，把指纹用 --fingerprint 传回来再写入。"
-    fi
-    exit 2
-  fi
-  scanfp="$(printf '%s\n' "$keys" | ssh-keygen -lf - 2>/dev/null)"
-  printf '%s\n' "$scanfp" | sed 's/^/  /'
-
-  # --fingerprint：把"人工核对过"变成机制。
-  # 只有当扫描到的指纹里**确实有**用户确认过的那个值，才允许写入。
-  if [ -n "$FINGERPRINT" ]; then
-    if printf '%s\n' "$scanfp" | grep -qF -- "$FINGERPRINT"; then
-      say "${C_GRN}指纹与 --fingerprint 提供的值一致，核对通过。${C_OFF}"
-    else
-      err "指纹不匹配！扫描到的指纹里没有你提供的 $FINGERPRINT"
-      err "已拒绝写入 known_hosts。这可能是中间人，也可能是你抄错了值 —— 两种情况都别继续。"
-      exit 2
-    fi
-  fi
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    dim "  (dry-run：未写入)"
-    exit 0
-  fi
-
-  # 已存在且指纹不同的处理：直接 >> 追加会在旧密钥后面再加一条，
-  # ssh 仍然匹配到第一条并继续报错，现象非常误导。
-  kh="$HOME/.ssh/known_hosts"
-  kh_entry="$HOST"; [ -n "$PORT" ] && [ "$PORT" != "22" ] && kh_entry="[$HOST]:$PORT"
-  if [ -f "$kh" ] && ssh-keygen -F "$kh_entry" -f "$kh" >/dev/null 2>&1; then
-    oldfp="$(ssh-keygen -F "$kh_entry" -f "$kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | head -1 | awk '{print $2}')"
-    newfp="$(printf '%s\n' "$scanfp" | head -1 | awk '{print $2}')"
-    if [ -n "$oldfp" ] && [ "$oldfp" != "$newfp" ]; then
-      err "known_hosts 里 $kh_entry 已存在，且指纹与现在扫描到的不一致："
-      say "  已有: $oldfp"
-      say "  扫描: $newfp"
-      say "  这通常意味着目标重装了系统或换了机器，但也可能是中间人。"
-      say "  确认是重装后，先删除旧记录再重试："
-      say "    ssh-keygen -R \"$kh_entry\""
-      exit 2
-    fi
-  fi
-
-  mkdir -p "$HOME/.ssh"
-  chmod 700 "$HOME/.ssh" 2>/dev/null || true
-  printf '%s\n' "$keys" >> "$kh"
-  say "${C_GRN}已写入 $kh。${C_OFF}"
-fi
-
-# ---------- --dry-run ----------
-# ⚠ 输出格式有下游依赖：batch_run.sh 用
-#   sed -n 's/^风险等级  : tier\([0-9]\).*/\1/p'
-#   精确解析这一行。加行可以，改这一行的形状不行。
-if [ "$DRY_RUN" -eq 1 ]; then
-  say "目标      : $TARGET_LABEL"
-  say "风险等级  : tier${RISK_TIER} (${RISK_REASON})"
-  say "超时      : ${TIMEOUT}s (连接 ${CONNECT_TIMEOUT}s)"
-  if [ -n "$SCRIPT_FILE" ]; then
-    say "脚本      : $SCRIPT_FILE  ->  远端 $REMOTE_SCRIPT_CMD"
-  else
-    say "将执行    : $COMMAND"
-  fi
-  if [ "$RISK_TIER" -ge 1 ] && [ "$READ_ONLY_DECLARED" -eq 0 ]; then
-    say "${C_YEL}提示: 变更与高危操作需要先向用户说明影响面与回滚方案。${C_OFF}"
-  fi
-  exit 0
-fi
-
-# ---------- --selftest ----------
-# 一屏把"为什么连不上/口令为什么没发出去"能自查的东西全打出来。
-# 这比任何 fallback 都值：把凌晨两点的谜题变成 5 秒答案。
-if [ "$SELFTEST" -eq 1 ]; then
-  # 中文标签是双宽字符，printf 的 %-22s 按字节补空格会错位；本脚本 LC_ALL=C，
-  # bash 的 ${#s} 也只数字节。自己算显示列宽：ASCII 1 列，UTF-8 多字节字符 2 列。
-  _sw() {
-    local s="$1" i b w=0
-    for ((i=0; i<${#s}; i++)); do
-      b=$(printf '%d' "'${s:i:1}" 2>/dev/null) || b=63
-      if   [ "$b" -ge 192 ]; then w=$((w+2))
-      elif [ "$b" -ge 128 ]; then :
-      else w=$((w+1))
-      fi
-    done
-    printf '%d' "$w"
-  }
-  ST() { local w pad="" i; w="$(_sw "$1")"; for ((i=w; i<22; i++)); do pad="$pad "; done; printf '%s%s %s
-' "$1" "$pad" "$2"; }
-  printf '%s\n' "═══ ssh-server-manager 自检 ═══"
-  SSHBIN="$SSH_BIN"
-  case "$SSHBIN" in */*) ;; *) SSHBIN="$(command -v "$SSH_BIN" 2>/dev/null || echo "$SSH_BIN")" ;; esac
-  ST "ssh 可执行文件" "$SSHBIN$([ -n "${SSHMGR_SSH:-}" ] && echo "  (来自 SSHMGR_SSH)")"
-  ST "ssh 版本" "$([ -x "$SSHBIN" ] && "$SSHBIN" -V 2>&1 | head -1 || echo '无法执行')"
-  case "$SSHBIN" in
-    /c/Windows/*|*System32*) printf '%-22s %s\n' "注意" "解析到 Windows 原生 ssh —— 它无法执行 shebang 脚本，askpass helper 会失败。建议在 Git-Bash 里跑，或用 SSHMGR_SSH 指定 msys 的 ssh" ;;
-  esac
-  if [ -n "$SSHBIN" ] && [ -r "$SSHBIN" ]; then
-    if grep -qa 'SSH_ASKPASS_REQUIRE' "$SSHBIN" 2>/dev/null; then
-      ST "askpass 支持" "是（二进制含 SSH_ASKPASS_REQUIRE）→ 密码登录可用，无需 sshpass"
-    else
-      ST "askpass 支持" "否 —— 这个 ssh 太老，密码登录会不可靠"
-    fi
-  fi
-  ST "sshpass" "$(command -v sshpass 2>/dev/null || echo '未安装（不影响：本机走 askpass）')"
-  if (exec 3<>/dev/tcp/127.0.0.1/1) 2>/dev/null; then
-    ST "/dev/tcp" "可用"
-  else
-    ST "/dev/tcp" "可用（本地拒绝端口，符合预期）"
-  fi
-  ST "GNU timeout" "${TIMEOUT_BIN:-未找到（超时保护将不可用）}"
-  ST "审计日志目录" "$LOG_DIR"
-  ST "凭据文件" "$CRED_FILE_DEFAULT $([ -f "$CRED_FILE_DEFAULT" ] && echo '(存在)' || echo '(未创建)')"
-  # ControlMaster 是否真的可用：建一个到本地的假连接测不出来，只能看目录能不能建
-  if [ "${SSHMGR_NO_MUX:-0}" = "1" ]; then
-    ST "连接复用" "已通过 SSHMGR_NO_MUX 关闭"
-  elif mkdir -p "$LOG_DIR/cm" 2>/dev/null; then
-    ST "连接复用" "可用（$LOG_DIR/cm，10 分钟内只认证一次）"
-  else
-    ST "连接复用" "不可用（$LOG_DIR/cm 建不出来）"
-  fi
-  # askpass helper 端到端自测：真的生成一个、执行它、看能不能取回口令
-  printf '\n生成一个临时 askpass helper 做端到端自测...\n'
-  _saved_pw_test="selftest-$(date +%s)"
-  PASSWORD="$_saved_pw_test"
-  if setup_askpass 2>/dev/null; then
-    got="$("$ASKPASS_HELPER" "test prompt" 2>/dev/null)"
-    if [ "$got" = "$_saved_pw_test" ]; then
-      ST "askpass 端到端" "通过（helper 能正确回传口令）"
-    else
-      ST "askpass 端到端" "失败：helper 回传了 '${got:0:20}'，与预期不符"
-    fi
-  else
-    ST "askpass 端到端" "失败：helper 建不出来（临时目录不可写？）"
-  fi
-  PASSWORD=""
-  printf '\n透明代理检查（对照探测保留地址，能连上说明本机栈在拦截流量）：\n'
-  if [ -f "$SCRIPT_DIR_SELF/tcping.sh" ]; then
-    bash "$SCRIPT_DIR_SELF/tcping.sh" -H 192.0.2.1 -p 9 -n 1 -q 2>/dev/null | head -1
-  fi
-  exit 0
-fi
-
-# ---------- 高危拦截 ----------
-if [ "$RISK_TIER" -eq 2 ] && [ "$CONFIRM_DANGER" -ne 1 ]; then
-  err "该命令被判为高危，已拒绝执行。"
-  say "  判定依据: $RISK_REASON"
-  say "  命令原文: $COMMAND"
-  say ""
-  say "  执行前需要做到："
-  say "    1) 把上面这条确切命令原文给用户看，明确问一次是否执行"
-  say "    2) 说明回退方案（备份在哪、怎么还原、备用登录入口）"
-  say "    3) 用户确认后，加 --confirm-danger 重新调用"
-  log_cmd 4 0
-  exit 4
-fi
-
+# ---------- 连接预检 ----------
 if [ "$RISK_TIER" -eq 1 ] && [ "$READ_ONLY_DECLARED" -eq 0 ]; then
   warn "变更类操作：确认已向用户说明影响面与回滚方式。"
 fi
 
-# ---------- 连接预检 ----------
 say "${C_DIM}-> ${TARGET_LABEL} (tier${RISK_TIER}${AUTH_RESOLVED:+, auth=${AUTH_RESOLVED}})${C_OFF}"
 
 start_ts=$(date +%s)
 preflight_rc=0
 preflight_out=""
 if [ "$NO_PREFLIGHT" -eq 0 ]; then
-  set +e
-  if [ -n "$TIMEOUT_BIN" ]; then
-    preflight_out="$("$TIMEOUT_BIN" "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" true 2>&1)"
-  else
-    preflight_out="$("$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" true 2>&1)"
-  fi
+  preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" true 2>&1)"
   preflight_rc=$?
-  set -e
 fi
 
 if [ "$preflight_rc" -ne 0 ]; then
@@ -918,7 +1013,7 @@ fi
 if [ "$NO_PREFLIGHT" -eq 0 ] && [ "${SSHMGR_NO_HINT:-0}" != "1" ]; then
   PS="$SCRIPT_DIR_SELF/profile_store.sh"
   if [ -f "$PS" ]; then
-    hintline="$(bash "$PS" hint -H "$HOST" 2>/dev/null | head -1)"
+    hintline="$(bash "$PS" hint -H "$HOST" 2>/dev/null | head -1)" || hintline=""
     [ -n "$hintline" ] && hint "  $hintline"
   fi
 fi
@@ -933,24 +1028,14 @@ fi
 # ---------- 执行 ----------
 say "${C_DIM}-> 执行中 (timeout ${TIMEOUT}s)...${C_OFF}"
 OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/sshmgr.XXXXXX")" || { err "无法创建临时文件"; exit 1; }
-out_file="$OUT_FILE"   # 兼容下面的引用；真正的清理由 cleanup() 统一负责
+TMP_FILES+=("$OUT_FILE")
 
-set +e
 if [ -n "$SCRIPT_FILE" ]; then
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_SCRIPT_CMD" < "$SCRIPT_FILE" > "$OUT_FILE" 2>&1
-  else
-    "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_SCRIPT_CMD" < "$SCRIPT_FILE" > "$OUT_FILE" 2>&1
-  fi
+  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_SCRIPT_CMD" < "$SCRIPT_FILE" > "$OUT_FILE" 2>&1
 else
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$COMMAND" > "$OUT_FILE" 2>&1
-  else
-    "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$COMMAND" > "$OUT_FILE" 2>&1
-  fi
+  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$COMMAND" > "$OUT_FILE" 2>&1
 fi
 rc=$?
-set -e
 dur=$(( $(date +%s) - start_ts ))
 
 cat "$OUT_FILE"
@@ -982,7 +1067,7 @@ if [ "$rc" -eq 0 ] && [ "$RISK_TIER" -ge 1 ] && [ "$DRY_RUN" -eq 0 ]; then
       *ufw*|*firewall-cmd*|*iptables*|*nft*) secs="security" ;;
       *mount*|*fstab*|*mkfs*|*parted*|*fdisk*|*lvm*) secs="storage" ;;
       *useradd*|*usermod*|*userdel*|*passwd*) secs="security,services" ;;
-      *nginx*|*httpd*|*nginx.conf*) secs="services,runtimes" ;;
+      *nginx*|*httpd*) secs="services,runtimes" ;;
     esac
     if [ -n "$secs" ]; then
       bash "$PS" mark-stale -H "$HOST" --sections "$secs" \
