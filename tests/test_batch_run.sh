@@ -26,6 +26,33 @@ assert_contains "目标清单（2 台）" "$out" "target list"
 assert_contains "成功 2 / 失败 0" "$out" "summary counts"
 assert_contains "完整输出已保存在:" "$out" "output dir line"
 
+# 1b. Machine-readable summary and explicit old-log pruning.
+PYEXE=""
+if command -v python3 >/dev/null 2>&1; then PYEXE="python3"
+elif command -v python >/dev/null 2>&1; then PYEXE="python"; fi
+if [ -n "$PYEXE" ]; then
+  CURRENT_TEST="json summary"
+  out="$(bash "$BR" --hosts-file "$SANDBOX/hosts.txt" --cmd 'uptime' --json-out "$SANDBOX/summary.json" 2>&1)"
+  rc=$?
+  assert_rc 0 "$rc" "json summary rc: $out"
+  "$PYEXE" - "$SANDBOX/summary.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as fh:
+    d = json.load(fh)
+assert d['counts']['total'] == 2, d
+assert d['counts']['ok'] == 2, d
+assert d['tier'] == 0, d
+assert len(d['hosts']) == 2, d
+PY
+  assert_rc 0 $? "json summary shape"
+fi
+
+CURRENT_TEST="prune batches"
+rm -rf "$SSHMGR_HOME"/batch-*
+mkdir -p "$SSHMGR_HOME/batch-old1" "$SSHMGR_HOME/batch-old2" "$SSHMGR_HOME/batch-old3"
+bash "$BR" --hosts-file "$SANDBOX/hosts.txt" --cmd 'uptime' --prune-batches 2 >/dev/null 2>&1
+assert_eq "2" "$(find "$SSHMGR_HOME" -maxdepth 1 -type d -name 'batch-*' | wc -l | tr -d ' ')" "prune should keep two batch dirs"
+
 # 2. Duplicate targets are collapsed.
 CURRENT_TEST="duplicate targets"
 printf 'web1\nweb1\n' > "$SANDBOX/dupes.txt"

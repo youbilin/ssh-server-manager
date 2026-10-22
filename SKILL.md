@@ -1,7 +1,7 @@
 ---
 name: ssh-server-manager
 description: Use when the user wants to connect to, inspect, deploy to, or troubleshoot a remote Linux server over SSH, even when they never say SSH. Supports account+password login — no key setup needed first. Trigger on Chinese phrases such as ssh 登录, 远程服务器, 登录服务器, 用账号密码登录, 密码登录, 运维, 部署上线, 重启服务, 查日志, 服务器挂了, 网站 502, 磁盘满了, CPU 跑满, 服务器信息, 硬件信息, 服务器画像, 这台机器什么配置, 对比服务器, 第一次连这台, 批量执行, 多台机器, 上传下载文件, 跳板机, 免密登录; and English phrases such as ssh into, remote server, server ops, deploy to prod, restart nginx, tail the logs, check server health, disk space, firewall rules, batch run across hosts, password login, server inventory, hardware specs. Do not trigger for local-only shell work, container orchestration with no remote host, or code review. Covers password/key auth, cached per-host profiles (hardware, Docker services, disk baseline), connectivity debugging, health checks, process/service management, logs, file transfer, package/Docker deploys, firewall/user administration, and batch operations across hosts.
-compatibility: Local machine needs ssh, scp (rsync optional), and bash 4+. Password login uses ssh's built-in SSH_ASKPASS — no sshpass required. python3 is optional and only used to parse multi-host inventories. Target hosts must be Linux; systemd distributions (Ubuntu/Debian/CentOS/Rocky/Alma) are supported, and Alpine/OpenRC works when bash is installed (`apk add bash`). Scripts execute remotely via `bash -s`.
+compatibility: Local machine needs ssh, scp (rsync optional), and bash 3.2+ (4+ recommended). Password login uses ssh's built-in SSH_ASKPASS — no sshpass required. python3 is optional and only used to parse multi-host inventories and write --json-out. Target hosts must be Linux; systemd distributions (Ubuntu/Debian/CentOS/Rocky/Alma) are supported, and Alpine/OpenRC works when bash is installed (`apk add bash`). Scripts execute remotely via `bash -s`.
 ---
 
 # SSH Server Operations
@@ -351,9 +351,9 @@ for host-key checks and profile naming, so aliases and non-22 ports are handled 
 - **Connection multiplexing is on by default** (`ControlMaster` + `ControlPath=$LOG_DIR/cm/%C`
   + `ControlPersist=10m`). This matters especially for password login: without multiplexing,
   every invocation does preflight + execute = **two authentications**, meaning the password is
-  submitted twice and the opportunity for a `Failed password` entry doubles. If the preflight
-  reports a mux failure, the wrapper retries once without multiplexing automatically. In
-  unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
+  submitted twice and the opportunity for a `Failed password` entry doubles. If preflight or
+  execution reports a mux failure, the wrapper falls back to a direct connection and remembers
+  it for that host for 10 minutes. In unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
 - Through a jump host (`-J`), a local tcping does not measure latency to the target; the script
   records it as `skip=jump`.
 - For connection-failure diagnosis order and commands see section 1 of
@@ -577,6 +577,8 @@ scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y upgrade' --confirm
   for every host.
 - Each run writes to a unique `~/.ssh-server-manager/batch-<UTC>.<random>/` directory, with
   per-host logs named by index rather than by alias. Aliases are display labels, not file paths.
+  Add `--json-out FILE` for a machine-readable per-host summary (requires Python), and
+  `--prune-batches N` to explicitly keep only the newest N batch directories.
 - `--parallel 1 --stop-on-error` is the steadier combination for a first mutating run: one host
   at a time, stopping immediately on a problem. With `--parallel > 1`, up to N already-started
   hosts will finish even after a failure is detected.

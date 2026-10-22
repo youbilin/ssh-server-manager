@@ -324,9 +324,9 @@ mechanism rather than a good intention.
 - **Connection multiplexing is on by default** (`ControlMaster` + `ControlPath=$LOG_DIR/cm/%C`
   + `ControlPersist=10m`). This matters especially for password login: without multiplexing,
   every invocation does preflight + execute = **two authentications**, meaning the password is
-  submitted twice and the opportunity for a `Failed password` entry doubles. If the preflight
-  reports a mux failure, the wrapper retries once without multiplexing automatically. In
-  unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
+  submitted twice and the opportunity for a `Failed password` entry doubles. If preflight or
+  execution reports a mux failure, the wrapper falls back to a direct connection and remembers
+  it for that host for 10 minutes. In unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
 - Through a jump host (`-J`), a local tcping does not measure latency to the target; the script
   records it as `skip=jump`.
 - For connection-failure diagnosis order and commands see section 1 of
@@ -547,7 +547,8 @@ bash $SKILL_DIR/scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y up
   step cannot be skipped; dangerous commands also need `--confirm-danger`.
 - Inventory entries may set `auth: auto|key|password`; command-line `--auth` overrides it.
 - Each run writes to a unique output directory with per-host logs named by index, so aliases are
-  display labels rather than file paths.
+  display labels rather than file paths. `--json-out FILE` produces a machine-readable per-host
+  summary (requires Python); `--prune-batches N` explicitly keeps only the newest N directories.
 - `--parallel 1 --stop-on-error` is the steadier combination for a first mutating run: one host
   at a time, stopping immediately on a problem. With higher concurrency, up to N already-started
   hosts will finish after a failure is detected.

@@ -37,6 +37,8 @@ CONFIRM_DANGER=0
 ASSUME_YES=0
 STOP_ON_ERROR=0
 MAX_OUTPUT_LINES=40
+JSON_OUT=""
+PRUNE_BATCHES=""
 
 DEF_USER=""
 DEF_PORT=""
@@ -80,6 +82,8 @@ usage() {
   --confirm-danger       声明已就高危命令向用户二次确认
   --yes                  确认目标清单（任何变更/高危批量都必须显式给出）
   --max-output-lines N   成功主机最多回显多少行输出（默认 40，失败主机总是全量回显）
+  --json-out FILE        把逐主机结果写成 JSON（需要 python3）
+  --prune-batches N      保留最近 N 个 batch 输出目录（含本次；显式启用才删除）
 
 连接默认值（可被清单中的逐机配置覆盖）:
   --user U  --port P  --jump J  --identity FILE
@@ -112,6 +116,8 @@ while [ $# -gt 0 ]; do
     --confirm-danger)  CONFIRM_DANGER=1; shift ;;
     --yes|-y)          ASSUME_YES=1; shift ;;
     --max-output-lines) need_arg "$1" $#; MAX_OUTPUT_LINES="$2"; shift 2 ;;
+    --json-out)        need_arg "$1" $#; JSON_OUT="$2"; shift 2 ;;
+    --prune-batches)   need_arg "$1" $#; PRUNE_BATCHES="$2"; shift 2 ;;
     --user)            need_arg "$1" $#; DEF_USER="$2"; shift 2 ;;
     --port)            need_arg "$1" $#; DEF_PORT="$2"; shift 2 ;;
     --jump)            need_arg "$1" $#; DEF_JUMP="$2"; shift 2 ;;
@@ -131,9 +137,19 @@ done
 case "$PARALLEL" in ''|*[!0-9]*) err "--parallel 必须是整数"; exit 2 ;; esac
 case "$TIMEOUT" in ''|*[!0-9]*) err "--timeout 必须是整数"; exit 2 ;; esac
 case "$MAX_OUTPUT_LINES" in ''|*[!0-9]*) err "--max-output-lines 必须是整数"; exit 2 ;; esac
+case "$PRUNE_BATCHES" in
+  '') ;;
+  *[!0-9]*) err "--prune-batches 必须是整数"; exit 2 ;;
+esac
 [ "$PARALLEL" -ge 1 ] || { err "--parallel 至少为 1"; exit 2; }
 [ "$TIMEOUT" -ge 1 ] || { err "--timeout 至少为 1"; exit 2; }
 [ "$MAX_OUTPUT_LINES" -ge 1 ] || { err "--max-output-lines 至少为 1"; exit 2; }
+if [ -n "$PRUNE_BATCHES" ] && [ "$PRUNE_BATCHES" -lt 1 ]; then
+  err "--prune-batches 至少为 1（显式指定才清理旧目录）"; exit 2
+fi
+if [ -n "$JSON_OUT" ] && [ ! -d "$(dirname "$JSON_OUT")" ]; then
+  err "--json-out 的目录不存在: $(dirname "$JSON_OUT")"; exit 2
+fi
 case "$AUTH_MODE" in ''|auto|key|password) ;; *) err "--auth 只能是 auto|key|password"; exit 2 ;; esac
 if [ "$AUTH_MODE" = "key" ] && { [ -n "$PASSWORD_ENV" ] || [ -n "$CREDENTIAL_FILE" ] || [ "$PROMPT_CREDENTIAL" -eq 1 ] || [ "$SAVE_CREDENTIAL" -eq 1 ] || [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; }; then
   err "--auth key 与密码相关选项冲突"; exit 2
@@ -231,8 +247,8 @@ for entry in hosts:
         auth,
     ]
     for v in fields:
-        if "|" in v or "\n" in v or "\r" in v:
-            sys.stderr.write("inventory: %s 的字段包含 | 或换行，拒绝继续\n" % label)
+        if "|" in v or "\n" in v or "\r" in v or "\t" in v:
+            sys.stderr.write("inventory: %s 的字段包含 |、制表符或换行，拒绝继续\n" % label)
             sys.exit(1)
     if any(ch.isspace() for ch in host):
         sys.stderr.write("inventory: %s 的 host 含有空白字符，拒绝继续\n" % label)
@@ -448,9 +464,36 @@ any_failed() {
   return 1
 }
 
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SUMMARY_TSV=""
+if [ -n "$JSON_OUT" ]; then
+  SUMMARY_TSV="$(mktemp "$OUTDIR/summary.XXXXXX" 2>/dev/null)" || { err "无法创建 JSON 汇总临时文件"; exit 2; }
+fi
+
 printf '\n%s开始执行（并发 %s，单机超时 %ss）...%s\n' "$C_DIM" "$PARALLEL" "$TIMEOUT" "$C_OFF"
 
+# bash 4.3+ 的 wait -n 可以按“任意一台完成”回收槽位；Bash 3.2 退回 FIFO wait。
+HAVE_WAIT_N=0
+_wn_err="$( (wait -n) 2>&1 )"
+case "$_wn_err" in
+  *"invalid option"*|*"invalid usage"*) HAVE_WAIT_N=0 ;;
+  *) HAVE_WAIT_N=1 ;;
+esac
+
 pids=()
+running=0
+wait_one() {
+  if [ "$HAVE_WAIT_N" -eq 1 ]; then
+    wait -n 2>/dev/null || true
+    running=$((running - 1))
+  else
+    [ "${#pids[@]}" -gt 0 ] || return 0
+    wait "${pids[0]}" 2>/dev/null || true
+    pids=("${pids[@]:1}")
+    running=$((running - 1))
+  fi
+}
+
 aborted=0
 host_idx=0
 while IFS='|' read -r label host user port jump ident hauth; do
@@ -464,9 +507,9 @@ while IFS='|' read -r label host user port jump ident hauth; do
   printf '  -> 派发 %s\n' "$label"
   run_one "$host_idx" "$label" "$host" "$user" "$port" "$jump" "$ident" "$hauth" &
   pids+=( $! )
-  if [ "${#pids[@]}" -ge "$PARALLEL" ]; then
-    wait "${pids[0]}" 2>/dev/null || true
-    pids=("${pids[@]:1}")
+  running=$((running + 1))
+  if [ "$running" -ge "$PARALLEL" ]; then
+    wait_one
     if [ "$STOP_ON_ERROR" -eq 1 ] && any_failed; then
       aborted=1
       warn "--stop-on-error：已检测到失败主机，停止派发后续主机"
@@ -474,9 +517,8 @@ while IFS='|' read -r label host user port jump ident hauth; do
   fi
 done <<< "$HOSTS_RAW"
 
-while [ "${#pids[@]}" -gt 0 ]; do
-  wait "${pids[0]}" 2>/dev/null || true
-  pids=("${pids[@]:1}")
+while [ "$running" -gt 0 ]; do
+  wait_one
 done
 
 # ---------- 汇总 ----------
@@ -487,15 +529,20 @@ SKIP_COUNT=0
 FAILED_LIST=""
 host_idx=0
 
-while IFS='|' read -r label host _rest; do
+while IFS='|' read -r label host user port jump ident hauth; do
   [ -n "$host" ] || continue
   host_idx=$((host_idx + 1))
   rc="$(cat "$OUTDIR/$host_idx.rc" 2>/dev/null || echo unknown)"
   case "$rc" in
-    0)        OK_COUNT=$((OK_COUNT + 1));   STATUS="${C_GRN}OK${C_OFF}" ;;
-    skipped)  SKIP_COUNT=$((SKIP_COUNT + 1)); STATUS="${C_DIM}SKIPPED${C_OFF}" ;;
-    *)        FAIL_COUNT=$((FAIL_COUNT + 1)); STATUS="${C_RED}FAIL(rc=$rc)${C_OFF}"; FAILED_LIST="$FAILED_LIST $label" ;;
+    0)        OK_COUNT=$((OK_COUNT + 1));   STATUS="${C_GRN}OK${C_OFF}";   STATUS_KEY="ok" ;;
+    skipped)  SKIP_COUNT=$((SKIP_COUNT + 1)); STATUS="${C_DIM}SKIPPED${C_OFF}"; STATUS_KEY="skipped" ;;
+    *)        FAIL_COUNT=$((FAIL_COUNT + 1)); STATUS="${C_RED}FAIL(rc=$rc)${C_OFF}"; STATUS_KEY="failed"; FAILED_LIST="$FAILED_LIST $label" ;;
   esac
+  if [ -n "$SUMMARY_TSV" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$host_idx" "$label" "$host" "$user" "$port" "$jump" "$ident" "$rc" "$STATUS_KEY" "$OUTDIR/$host_idx.log" \
+      >> "$SUMMARY_TSV"
+  fi
   printf '  %-20s %s\n' "$label" "$STATUS"
   if [ "$rc" = "0" ]; then
     printf '%s\n' "$C_DIM"
@@ -519,5 +566,92 @@ fi
 printf '\n完整输出已保存在: %s\n' "$OUTDIR"
 printf '（每次批量执行都会新开一个目录；确认不需要留档后可以自行清理旧目录）\n'
 
+FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+JSON_FAILED=0
+if [ -n "$JSON_OUT" ]; then
+  if [ -z "$PYTHON" ]; then
+    err "--json-out 需要 python3 或 python"
+    JSON_FAILED=1
+  else
+    JSON_TMP="${JSON_OUT}.tmp.$$"
+    if JSON_OUT="$JSON_OUT" SUMMARY_TSV="$SUMMARY_TSV" TIER="$TIER" CMD="$CMD" \
+       STARTED_AT="$STARTED_AT" FINISHED_AT="$FINISHED_AT" OUTDIR="$OUTDIR" \
+       PARALLEL="$PARALLEL" TIMEOUT="$TIMEOUT" JSON_TMP="$JSON_TMP" \
+       "$PYTHON" - <<'PY'
+import io, json, os
+
+rows = []
+with io.open(os.environ["SUMMARY_TSV"], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 10:
+            continue
+        idx, label, host, user, port, jump, ident, rc_raw, status, log = parts[:10]
+        rc = int(rc_raw) if rc_raw.lstrip("-").isdigit() else rc_raw
+        rows.append({
+            "index": int(idx),
+            "label": label,
+            "host": host,
+            "user": user,
+            "port": port,
+            "jump": jump,
+            "identity": ident,
+            "rc": rc,
+            "status": status,
+            "log": log,
+        })
+
+tier_raw = os.environ.get("TIER", "0")
+tier = int(tier_raw) if tier_raw.isdigit() else 0
+doc = {
+    "started_at": os.environ["STARTED_AT"],
+    "finished_at": os.environ["FINISHED_AT"],
+    "command": os.environ["CMD"],
+    "tier": tier,
+    "parallel": int(os.environ["PARALLEL"]),
+    "timeout": int(os.environ["TIMEOUT"]),
+    "outdir": os.environ["OUTDIR"],
+    "counts": {
+        "total": len(rows),
+        "ok": sum(1 for r in rows if r["status"] == "ok"),
+        "failed": sum(1 for r in rows if r["status"] == "failed"),
+        "skipped": sum(1 for r in rows if r["status"] == "skipped"),
+    },
+    "hosts": rows,
+}
+with io.open(os.environ["JSON_TMP"], "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+PY
+    then
+      mv "$JSON_TMP" "$JSON_OUT" || { rm -f "$JSON_TMP"; err "写入 JSON 失败: $JSON_OUT"; JSON_FAILED=1; }
+    else
+      rm -f "$JSON_TMP"
+      err "生成 JSON 失败"
+      JSON_FAILED=1
+    fi
+  fi
+fi
+[ -n "$SUMMARY_TSV" ] && rm -f "$SUMMARY_TSV"
+
+if [ "${PRUNE_BATCHES:-0}" -gt 0 ] && [ -d "$LOG_DIR" ]; then
+  _kept=0
+  _removed=0
+  while IFS= read -r _d; do
+    [ -d "$_d" ] || continue
+    _kept=$((_kept + 1))
+    if [ "$_kept" -gt "$PRUNE_BATCHES" ]; then
+      rm -rf "$_d" 2>/dev/null && _removed=$((_removed + 1))
+    fi
+  done <<EOF
+$(ls -1dt "$LOG_DIR"/batch-* 2>/dev/null)
+EOF
+  [ "$_removed" -gt 0 ] && printf '已按 --prune-batches %s 清理 %s 个旧输出目录\n' "$PRUNE_BATCHES" "$_removed"
+fi
+
+[ "$JSON_FAILED" -eq 1 ] && exit 2
 [ "$FAIL_COUNT" -gt 0 ] && exit 1
 exit 0

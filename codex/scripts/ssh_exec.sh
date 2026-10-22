@@ -69,11 +69,13 @@ NO_PREFLIGHT=0
 SELFTEST=0
 # 文件传输：复用同一套认证/主机密钥/审计，避免 scp/rsync 绕过 wrapper
 TRANSFER_MODE=""          # upload | download
+TRANSFER_TOOL="scp"       # scp | rsync
 UPLOAD_LOCAL=""
 UPLOAD_REMOTE=""
 DOWNLOAD_REMOTE=""
 DOWNLOAD_LOCAL=""
 RECURSIVE=0
+RSYNC_SSH_WRAPPER=""
 # 密码认证
 AUTH_MODE="auto"          # auto | key | password
 PASSWORD_ENV=""           # --password-env VAR
@@ -160,6 +162,7 @@ usage() {
       --download REMOTE LOCAL
                          下载文件：远端 REMOTE -> 本地 LOCAL
       --recursive        配合 --upload/--download 传输目录（scp -r）
+      --rsync            传输改用 rsync（支持断点续传；目标机需安装 rsync）
       --accept-host-key  首次连接时把远端指纹写入 known_hosts（须先人工核对指纹）
                          单独使用即可，不必同时给 -c；写入前必须提供 --fingerprint
       --show-host-key    只扫描并打印候选指纹，不写入 known_hosts
@@ -194,6 +197,7 @@ usage() {
   SSHMGR_CREDENTIAL_FILE  默认凭据文件路径
   SSHMGR_SSH              指定 ssh 可执行文件（默认从 PATH 解析）
   SSHMGR_SCP              指定 scp 可执行文件（--upload/--download 用）
+  SSHMGR_RSYNC            指定 rsync 可执行文件（--rsync 传输用）
   SSHMGR_ASKPASS_DEBUG=1  把 askpass 收到的 prompt 记到 askpass.log（绝不记口令），
                           用于排查"口令为什么没发出去"
   SSHMGR_NO_MUX=1         关闭连接复用（默认开 ControlMaster，10 分钟内只认证一次）
@@ -232,6 +236,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 3 ] || { err "--download 需要 REMOTE 和 LOCAL 两个参数"; exit 1; }
       TRANSFER_MODE="download"; DOWNLOAD_REMOTE="$2"; DOWNLOAD_LOCAL="$3"; shift 3 ;;
     --recursive)       RECURSIVE=1; shift ;;
+    --rsync)           TRANSFER_TOOL="rsync"; shift ;;
     --no-log)          DO_LOG=0; shift ;;
     --label)           need_arg "$1" $#; LOG_LABEL="$2"; shift 2 ;;
     --selftest)        SELFTEST=1; shift ;;
@@ -293,6 +298,9 @@ fi
 if [ "$RECURSIVE" -eq 1 ] && [ -z "$TRANSFER_MODE" ]; then
   err "--recursive 只能配合 --upload/--download 使用"; exit 1
 fi
+if [ "$TRANSFER_TOOL" = "rsync" ] && [ -z "$TRANSFER_MODE" ]; then
+  err "--rsync 只能配合 --upload/--download 使用"; exit 1
+fi
 if [ "$ACCEPT_HOST_KEY" -eq 1 ] && [ "$SHOW_HOST_KEY" -eq 1 ]; then
   err "--accept-host-key 与 --show-host-key 不能同时使用"; exit 1
 fi
@@ -334,8 +342,13 @@ if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ] && [ "$S
 fi
 
 if [ -n "$TRANSFER_MODE" ]; then
-  SCP_BIN="${SSHMGR_SCP:-scp}"
-  command -v "$SCP_BIN" >/dev/null 2>&1 || [ -x "$SCP_BIN" ] || { err "找不到 scp 可执行文件: $SCP_BIN（可用 SSHMGR_SCP 指定）"; exit 1; }
+  if [ "$TRANSFER_TOOL" = "scp" ]; then
+    SCP_BIN="${SSHMGR_SCP:-scp}"
+    command -v "$SCP_BIN" >/dev/null 2>&1 || [ -x "$SCP_BIN" ] || { err "找不到 scp 可执行文件: $SCP_BIN（可用 SSHMGR_SCP 指定）"; exit 1; }
+  else
+    RSYNC_BIN="${SSHMGR_RSYNC:-rsync}"
+    command -v "$RSYNC_BIN" >/dev/null 2>&1 || [ -x "$RSYNC_BIN" ] || { err "找不到 rsync 可执行文件: $RSYNC_BIN（可用 SSHMGR_RSYNC 指定）"; exit 1; }
+  fi
   if [ "$TRANSFER_MODE" = "upload" ]; then
     [ -e "$UPLOAD_LOCAL" ] || { err "本地路径不存在: $UPLOAD_LOCAL"; exit 1; }
     [ -n "$HOST" ] || { err "--upload 需要目标主机（-H）"; exit 1; }
@@ -367,9 +380,17 @@ if [ -n "$USER_NAME" ]; then
 fi
 
 if [ "$TRANSFER_MODE" = "upload" ]; then
-  COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${UPLOAD_LOCAL} ${TARGET}:${UPLOAD_REMOTE}"
+  if [ "$TRANSFER_TOOL" = "rsync" ]; then
+    COMMAND="rsync -avz --partial ${UPLOAD_LOCAL} ${TARGET}:${UPLOAD_REMOTE}"
+  else
+    COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${UPLOAD_LOCAL} ${TARGET}:${UPLOAD_REMOTE}"
+  fi
 elif [ "$TRANSFER_MODE" = "download" ]; then
-  COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${TARGET}:${DOWNLOAD_REMOTE} ${DOWNLOAD_LOCAL}"
+  if [ "$TRANSFER_TOOL" = "rsync" ]; then
+    COMMAND="rsync -avz --partial ${TARGET}:${DOWNLOAD_REMOTE} ${DOWNLOAD_LOCAL}"
+  else
+    COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${TARGET}:${DOWNLOAD_REMOTE} ${DOWNLOAD_LOCAL}"
+  fi
 fi
 
 # ---------- 风险分级 ----------
@@ -960,19 +981,38 @@ fi
 # ControlPersist 10m 让这段时间内只认证一次。msys 的 ssh 不会自己建 ControlPath 目录。
 SSH_OPTS_CORE=("${SSH_OPTS[@]}")
 MUX_ENABLED=0
+MUX_TTL=600
+MUX_CACHE=""
+if [ -n "$HOST" ]; then
+  _mux_key="$(printf '%s_%s' "$HOST" "${PORT:-22}" | tr -c 'A-Za-z0-9._-' '_')"
+  MUX_CACHE="$LOG_DIR/mux-off.$_mux_key"
+fi
 if [ "${SSHMGR_NO_MUX:-0}" != "1" ]; then
-  CM_DIR="$LOG_DIR/cm"
-  if mkdir -p "$CM_DIR" 2>/dev/null; then
-    chmod 700 "$CM_DIR" 2>/dev/null || true
-    SSH_OPTS+=( -o ControlMaster=auto -o "ControlPath=$CM_DIR/%C" -o ControlPersist=10m )
-    MUX_ENABLED=1
+  _mux_skip=0
+  if [ -n "$MUX_CACHE" ] && [ -f "$MUX_CACHE" ]; then
+    _mux_ts="$(cat "$MUX_CACHE" 2>/dev/null)"
+    case "$_mux_ts" in ''|*[!0-9]*) _mux_ts=0 ;; esac
+    _mux_now="$(date +%s)"
+    if [ $((_mux_now - _mux_ts)) -lt "$MUX_TTL" ]; then
+      _mux_skip=1
+    else
+      rm -f "$MUX_CACHE" 2>/dev/null
+    fi
+  fi
+  if [ "$_mux_skip" -eq 0 ]; then
+    CM_DIR="$LOG_DIR/cm"
+    if mkdir -p "$CM_DIR" 2>/dev/null; then
+      chmod 700 "$CM_DIR" 2>/dev/null || true
+      SSH_OPTS+=( -o ControlMaster=auto -o "ControlPath=$CM_DIR/%C" -o ControlPersist=10m )
+      MUX_ENABLED=1
+    fi
   fi
 fi
 
 # 文件传输单独走 scp，直接连接（不依赖容易失效的 control socket），
 # 但认证方式、严格主机密钥和 askpass 与 ssh 路径完全一致。
 SCP_OPTS=()
-if [ -n "$TRANSFER_MODE" ]; then
+if [ -n "$TRANSFER_MODE" ] && [ "$TRANSFER_TOOL" = "scp" ]; then
   SCP_OPTS=(
     -S "$SSH_BIN"
     -o "ConnectTimeout=${CONNECT_TIMEOUT}"
@@ -990,6 +1030,22 @@ if [ -n "$TRANSFER_MODE" ]; then
   [ -n "$PORT" ] && SCP_OPTS+=( -P "$PORT" )
   [ -n "$JUMP" ] && SCP_OPTS+=( -o "ProxyJump=$JUMP" )
   [ -n "$IDENTITY" ] && SCP_OPTS+=( -i "$IDENTITY" -o IdentitiesOnly=yes )
+fi
+
+# rsync 需要一个本地 ssh 包装脚本作为 -e；把同一套 SSH_OPTS_CORE 写进去，
+# 这样认证、askpass、严格主机密钥和 jump/identity 都不会因工具切换而漂移。
+if [ -n "$TRANSFER_MODE" ] && [ "$TRANSFER_TOOL" = "rsync" ]; then
+  RSYNC_SSH_WRAPPER="$(mktemp "${TMPDIR:-/tmp}/sshmgr-rsync-ssh.XXXXXX" 2>/dev/null)" || {
+    err "无法创建 rsync 的 ssh 包装脚本"; exit 1; }
+  TMP_FILES+=("$RSYNC_SSH_WRAPPER")
+  {
+    printf '#!/bin/sh\n'
+    printf 'exec'
+    printf ' %q' "$SSH_BIN"
+    for _o in "${SSH_OPTS_CORE[@]}" -o ControlMaster=no; do printf ' %q' "$_o"; done
+    printf ' "$@"\n'
+  } > "$RSYNC_SSH_WRAPPER" || { err "写入 rsync 的 ssh 包装脚本失败"; exit 1; }
+  chmod 700 "$RSYNC_SSH_WRAPPER" 2>/dev/null || true
 fi
 
 # ---------- 错误诊断 ----------
@@ -1060,6 +1116,9 @@ diagnose() {
     *"bash: not found"*|*"bash: command not found"*)
       err "目标主机没有 bash —— -f 脚本模式需要 bash。"
       say "  解决：Alpine 执行 apk add bash（需 root），或改用 -c 执行 POSIX sh 兼容命令" ;;
+    *"rsync: not found"*|*"rsync: command not found"*)
+      err "远端没有 rsync —— --rsync 传输需要目标机安装 rsync。"
+      say "  解决：目标机安装 rsync，或去掉 --rsync 使用默认 scp" ;;
     *"command not found"*)
       warn "远端缺少该命令 —— 确认是否装在非标准路径，或需要先安装对应软件包。" ;;
   esac
@@ -1088,6 +1147,11 @@ if [ "$NO_PREFLIGHT" -eq 0 ]; then
   if [ "$preflight_rc" -ne 0 ] && [ "$MUX_ENABLED" -eq 1 ] && \
      printf '%s' "$preflight_out" | grep -Eqi 'mux_client|failed to connect to new control master|control master|multiplex'; then
     warn "连接复用（ControlMaster）失败，自动改用单连接重试（本次不复用连接）。"
+    if [ -n "$MUX_CACHE" ]; then
+      mkdir -p "$LOG_DIR" 2>/dev/null || true
+      printf '%s\n' "$(date +%s)" > "$MUX_CACHE" 2>/dev/null || true
+      say "  已记录：10 分钟内对该主机禁用连接复用。"
+    fi
     SSH_OPTS=("${SSH_OPTS_CORE[@]}")
     MUX_ENABLED=0
     preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$preflight_remote" 2>&1)"
@@ -1144,7 +1208,14 @@ TMP_FILES+=("$OUT_FILE" "$ERR_FILE")
 
 # stdout 是调用方消费的载荷（profile/health 的 key=value、batch 的日志）；
 # ssh 自己的警告（mux、IdentityFile）走 stderr，不能混进载荷。
-if [ "$TRANSFER_MODE" = "upload" ]; then
+if [ -n "$TRANSFER_MODE" ] && [ "$TRANSFER_TOOL" = "rsync" ]; then
+  _rsync_args=(-avz --partial --human-readable -e "$RSYNC_SSH_WRAPPER")
+  if [ "$TRANSFER_MODE" = "upload" ]; then
+    run_limited "$TIMEOUT" "$RSYNC_BIN" "${_rsync_args[@]}" -- "$UPLOAD_LOCAL" "${TARGET}:${UPLOAD_REMOTE}" > "$OUT_FILE" 2> "$ERR_FILE"
+  else
+    run_limited "$TIMEOUT" "$RSYNC_BIN" "${_rsync_args[@]}" -- "${TARGET}:${DOWNLOAD_REMOTE}" "$DOWNLOAD_LOCAL" > "$OUT_FILE" 2> "$ERR_FILE"
+  fi
+elif [ "$TRANSFER_MODE" = "upload" ]; then
   _scp_args=("${SCP_OPTS[@]}")
   [ "$RECURSIVE" -eq 1 ] && _scp_args+=(-r)
   run_limited "$TIMEOUT" "$SCP_BIN" "${_scp_args[@]}" -- "$UPLOAD_LOCAL" "${TARGET}:${UPLOAD_REMOTE}" > "$OUT_FILE" 2> "$ERR_FILE"
@@ -1163,6 +1234,16 @@ dur=$(( $(date +%s) - start_ts ))
 cat "$OUT_FILE"
 if [ -s "$ERR_FILE" ]; then
   cat "$ERR_FILE" >&2
+fi
+
+# 有些代理/Windows 组合下预检能建立 master，但执行时复用失败；ssh 会自行
+# 退回直连并继续执行。检测到这种情况就把该主机加入 10 分钟 no-mux 缓存。
+if [ "$MUX_ENABLED" -eq 1 ] && [ -n "$MUX_CACHE" ] && [ -s "$ERR_FILE" ] && \
+   grep -Eqi 'mux_client|failed to connect to new control master|disabling multiplexing' "$ERR_FILE"; then
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s\n' "$(date +%s)" > "$MUX_CACHE" 2>/dev/null || true
+  dim "  连接复用执行时不可用，已对该主机禁用复用 10 分钟。"
+  MUX_ENABLED=0
 fi
 
 if [ "$rc" -eq 124 ]; then

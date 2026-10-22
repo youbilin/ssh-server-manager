@@ -174,6 +174,14 @@ rc=$?
 assert_rc 0 "$rc" "mux fallback rc: $out"
 assert_contains "自动改用单连接" "$out" "mux fallback warning"
 
+CURRENT_TEST="mux failure cache"
+: > "$FAKE_SSH_LOG"
+out="$(FAKE_SSH_MUX_FAIL=1 bash "$SSH_EXEC" -H example.invalid --auth key -c 'true' 2>&1)"
+rc=$?
+assert_rc 0 "$rc" "cached mux fallback rc: $out"
+assert_not_contains "自动改用单连接" "$out" "second run should use the cached no-mux path"
+assert_not_contains "ControlMaster=auto" "$(cat "$FAKE_SSH_LOG")" "cached run should not attempt mux"
+
 # 11. Script mode preflights bash and gives an Alpine-specific message.
 CURRENT_TEST="missing remote bash"
 out="$(FAKE_SSH_NO_BASH=1 bash "$SSH_EXEC" -H example.invalid --auth key \
@@ -221,7 +229,23 @@ assert_rc 4 "$rc" "dangerous upload should be refused"
 assert_contains "已拒绝执行" "$out" "danger message"
 assert_eq "0" "$(wc -l < "$FAKE_SCP_LOG" | tr -d ' ')" "scp must not run without --confirm-danger"
 
-# 13. Usage guards.
+# 13. rsync transfer uses the same wrapper/auth path.
+CURRENT_TEST="rsync upload"
+: > "$FAKE_SCP_LOG"
+export FAKE_RSYNC_LOG="$SANDBOX/rsync.log"
+: > "$FAKE_RSYNC_LOG"
+out="$(sv -H example.invalid --auth key --rsync --upload "$LFILE" /tmp/remote.txt)"
+rc=$?
+assert_rc 0 "$rc" "rsync upload rc: $out"
+assert_contains "$LFILE" "$(cat "$FAKE_RSYNC_LOG")" "rsync should receive the local file"
+assert_contains "example.invalid:/tmp/remote.txt" "$(cat "$FAKE_RSYNC_LOG")" "rsync should receive the remote path"
+assert_contains "-e" "$(cat "$FAKE_RSYNC_LOG")" "rsync should use the generated ssh wrapper"
+
+CURRENT_TEST="rsync without transfer"
+out="$(sv -H example.invalid --auth key --rsync -c true)"
+assert_contains "只能配合" "$out" "rsync requires a transfer mode"
+
+# 14. Usage guards.
 CURRENT_TEST="usage guards"
 out="$(sv --fingerprint 'SHA256:x' -H h -c true)"
 assert_contains "只能配合" "$out" "fingerprint without accept/show should be rejected"

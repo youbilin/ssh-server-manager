@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Offline stand-in for rsync. Records argv, never opens a socket.
+set -uo pipefail
+[ -n "${FAKE_RSYNC_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_RSYNC_LOG"
+exit 0

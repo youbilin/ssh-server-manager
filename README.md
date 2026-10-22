@@ -54,7 +54,7 @@ mechanism, because a one-off login should not require generating a key pair firs
 | 📝 | Audit log | `timestamp \| host \| tier \| exit code \| duration \| command`, escaped and appended by the wrapper itself |
 | 🗂 | Server profiles | One-time collection of slow-moving facts; fingerprint-first identity; per-port files; local `compare` |
 | 🩺 | One-shot inspection | Structured report ending in `SSHMGR_VERDICT=OK\|WARN\|CRIT`; thresholds pass via `-A "--disk-warn 75"`; systemd and OpenRC service checks |
-| 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; auto-retries without a broken ControlMaster; `--selftest` validates the local environment |
+| 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; auto-retries without a broken ControlMaster and remembers it per host for 10 minutes; `--selftest` validates the local environment |
 | 🚫 | Benchmark refusal | `sysbench`/`fio`/`stress-ng`/`iperf3` are tier 2 by default — load tests on production corrupt metrics and can OOM a host |
 | 🧯 | Config-change protocol | Backup → syntax check → rollback timer → verify in a second session; the printed restore line already carries the ssh prefix |
 | 📤 | Audited transfers | `--upload`/`--download` reuse password askpass, strict host keys, tiering and audit; direct `scp`/`rsync` bypass them |
@@ -66,7 +66,7 @@ mechanism, because a one-off login should not require generating a key pair firs
 
 **Local machine**
 
-- `ssh`, `scp`, and `bash` 4.0 or newer
+- `ssh`, `scp`, and `bash` 3.2 or newer (4+ recommended; the suite is validated on macOS's 3.2)
 - Optional: `rsync` (many small files), `python3` with PyYAML (multi-host inventory parsing only)
 
 **Target hosts**
@@ -254,6 +254,8 @@ batch_run.sh --hosts 'web1 web2' --cmd 'df -h' --parallel 2
 batch_run.sh --hosts-file hosts.txt --cmd 'systemctl is-active nginx'
 batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime' --dry-run
 batch_run.sh --from-ssh-config 'web*' --cmd 'uptime'
+batch_run.sh --hosts-file hosts.txt --cmd 'uptime' --json-out result.json
+batch_run.sh --hosts-file hosts.txt --cmd 'uptime' --prune-batches 10
 ```
 
 Every host executes through `ssh_exec.sh`, so tiering and audit logging apply unchanged. Output is
@@ -263,6 +265,8 @@ needs `--yes`; dangerous commands also need `--confirm-danger`. Each run gets a 
 aliases cannot become paths. Inventory entries may set `auth: auto|key|password`; `--auth`
 overrides it for every host. `--parallel 1 --stop-on-error` is the recommended first run; with
 higher concurrency, up to N already-started hosts will finish after a failure is detected.
+`--json-out FILE` writes a per-host JSON summary (requires Python); `--prune-batches N`
+explicitly keeps only the newest N batch directories.
 
 ### `backup_config.sh` — pre-change backup
 
@@ -414,15 +418,15 @@ The suite needs no network and no real host: fake `ssh`, `ssh-keyscan` and `dock
 with host keys generated locally. It covers risk classification, dry-run/selftest side effects,
 credential temp files, exact host-key matching, profile port/lookup/stale/identity behavior,
 restore-command generation, Docker health classification, batch confirmation/stop behavior,
-audited transfer modes, and systemd/OpenRC service detection. CI runs the same suite on Ubuntu,
-macOS and Windows (Git-Bash),
+audited transfer modes, profile IO/JSON summaries, eval-fixture shape, and systemd/OpenRC service
+detection. CI runs the same suite on Ubuntu, macOS and Windows (Git-Bash),
 plus `shellcheck`, a BSD/onetrue-awk profile pass, and a Codex-copy sync check. Alpine/OpenRC
 targets need `bash` installed (`apk add bash`).
 
 ## Contributing
 
-Issues and pull requests are welcome. The scripts target `bash` 4 and must keep working on macOS,
-Linux, and Git-Bash on Windows. Run `bash tests/run.sh` and
+Issues and pull requests are welcome. The scripts target `bash` 3.2+ (4+ recommended) and must
+keep working on macOS, Linux, and Git-Bash on Windows. Run `bash tests/run.sh` and
 `bash scripts/ssh_exec.sh --selftest` before submitting. Please preserve the
 `# sshmgr:read-only` header marker on read-only collectors — the wrapper relies on it for tiering.
 
