@@ -33,4 +33,32 @@ CURRENT_TEST="quick docker note"
 out="$(bash "$HC" --sections docker --quick 2>&1)"
 assert_contains "跳过 Docker" "$out" "quick should say docker was skipped"
 
+CURRENT_TEST="OpenRC services"
+OB="$SANDBOX/openrc-bin"
+mkdir -p "$OB"
+cat > "$OB/systemctl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+cat > "$OB/rc-status" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *" --servicelist "*) printf 'Service\tStatus\nnginx\t[  started  ]\nsshd\t[  started  ]\nbroken\t[  crashed  ]\n' ;;
+  *" --crashed "*) echo broken ;;
+esac
+exit 0
+EOF
+cat > "$OB/rc-update" <<'EOF'
+#!/bin/sh
+printf 'nginx | default\nsshd | default\n'
+EOF
+chmod +x "$OB/systemctl" "$OB/rc-status" "$OB/rc-update" 2>/dev/null || true
+out="$(PATH="$OB:$PATH" bash "$HC" --sections services 2>&1)"
+assert_contains "init system" "$out" "manager line"
+assert_contains "openrc" "$out" "OpenRC manager"
+assert_contains "OpenRC running services" "$out" "running count"
+assert_contains "crashed OpenRC services" "$out" "crashed list"
+assert_contains "broken" "$out" "crashed service name"
+assert_contains "SSHMGR_VERDICT=CRIT" "$out" "crashed service verdict"
+
 summary "test_health_check"

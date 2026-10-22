@@ -979,6 +979,9 @@ diagnose() {
     *"sudo: a password is required"*|*"sudo: no tty present"*)
       err "远端 sudo 需要密码或 TTY —— 非交互执行无法提供输入。"
       say "  解决：为该命令配置 NOPASSWD，或改用交互式会话手工执行" ;;
+    *"bash: not found"*|*"bash: command not found"*)
+      err "目标主机没有 bash —— -f 脚本模式需要 bash。"
+      say "  解决：Alpine 执行 apk add bash（需 root），或改用 -c 执行 POSIX sh 兼容命令" ;;
     *"command not found"*)
       warn "远端缺少该命令 —— 确认是否装在非标准路径，或需要先安装对应软件包。" ;;
   esac
@@ -995,8 +998,21 @@ start_ts=$(date +%s)
 preflight_rc=0
 preflight_out=""
 if [ "$NO_PREFLIGHT" -eq 0 ]; then
-  preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" true 2>&1)"
+  # 脚本模式通过 stdin 交给远端 bash -s；Alpine 默认只有 ash，必须在预检就给出
+  # 明确提示，而不是执行到一半才报一个含糊的 command not found。
+  preflight_remote='true'
+  # 用 sh -c 包一层：登录 shell 可能是 csh，但它一定有 /bin/sh。
+  [ -n "$SCRIPT_FILE" ] && preflight_remote="sh -c 'command -v bash >/dev/null 2>&1 || { echo SSHMGR_PREFLIGHT_NO_BASH; exit 127; }'"
+  preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$preflight_remote" 2>&1)"
   preflight_rc=$?
+fi
+
+if [ "$preflight_rc" -ne 0 ] && printf '%s' "$preflight_out" | grep -q 'SSHMGR_PREFLIGHT_NO_BASH'; then
+  err "目标主机没有 bash —— 本 skill 的 -f 脚本模式需要 bash。"
+  say "  Alpine: apk add bash（需要 root）；安装后重试。"
+  say "  不需要脚本时，可用 -c 执行 POSIX sh 兼容命令。"
+  log_cmd 2 "$(( $(date +%s) - start_ts ))" "no-bash"
+  exit 2
 fi
 
 if [ "$preflight_rc" -ne 0 ]; then

@@ -50,14 +50,14 @@ a repository or paste them somewhere public.**
 
 | Section | Content |
 |---|---|
-| `identity` | hostname/fqdn, `ip_primary` (source address of the default route), `ip_all`, machine_id, boot_id, os-release, kernel, arch, virt, tz/NTP, uptime, SELinux/AppArmor, reboot-required, sshd unit name |
+| `identity` | hostname/fqdn, `init_system` (`systemd`/`openrc`/`unknown`), `ip_primary` (source address of the default route), `ip_all`, machine_id, boot_id, os-release, kernel, arch, virt, tz/NTP, uptime, SELinux/AppArmor, reboot-required, sshd unit name |
 | `hw` | CPU vendor/model/sockets/physical cores/threads/frequency/L3/NUMA/key flags, MemTotal, SwapTotal, DMI chassis, GPU |
 | `storage` | `lsblk -dn` disks and models, `findmnt` filesystems and usage, `/proc/diskstats` cumulative sectors (baseline) |
 | `network` | all addresses via `ip -br addr`, default gateway, listening ports via `ss -lnt`, DNS |
 | `docker` | version, container/image counts, driver, root dir, **full container inventory**, compose projects, volume/network counts |
-| `services` | running systemd units, failed units, timers, cron entry count, package manager |
+| `services` | running systemd units or OpenRC services, failed/crashed units, timers/enabled services, cron entry count, package manager (apt/dnf/yum/apk) |
 | `runtimes` | python3/node/php/java/go/ruby/nginx/mysqld/redis/psql versions |
-| `security` | firewall state, effective sshd config, accounts with a login shell |
+| `security` | firewall state (ufw/firewalld/nftables/iptables), effective sshd config, accounts with a login shell |
 
 `list` shows the stored average latency; `compare -H a,b` renders the slow-moving fields side by
 side without a network call.
@@ -104,6 +104,9 @@ These are not fastidiousness; each one corresponds to a real trap:
 - **`docker ps` often fails on socket permissions for a non-root user** → record
   `docker=present` plus `docker_accessible=no`. That is a completely different meaning from
   `docker=absent`, and is handled differently.
+- **Alpine/OpenRC has no `lscpu`, `lsblk`, `findmnt`, `ss` or `systemctl` by default** → fall
+  back to `/proc/cpuinfo`, `/sys/block`, `df -PT`, `netstat`, and `rc-status`/`rc-update`. This
+  requires `bash` on the target (`apk add bash`); `ssh_exec.sh` checks it before `-f` scripts.
 
 ## The Completeness Sentinel
 

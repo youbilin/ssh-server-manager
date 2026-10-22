@@ -10,6 +10,12 @@ case " $* " in
   *"fail-host"*) exit 9 ;;
 esac
 
+if [ "${FAKE_SSH_NO_BASH:-0}" = "1" ]; then
+  case " $* " in
+    *"command -v bash"*) echo "SSHMGR_PREFLIGHT_NO_BASH"; exit 127 ;;
+  esac
+fi
+
 for a in "$@"; do
   if [ "$a" = "-G" ]; then
     printf 'hostname %s\n' "${FAKE_SSH_G_HOST:-fake-host}"

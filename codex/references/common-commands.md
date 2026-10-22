@@ -154,6 +154,21 @@ sudo crontab -l -u www-data   # a specific user
 ls -l /etc/cron.d/ /etc/cron.daily/
 ```
 
+**OpenRC (Alpine)**
+
+```bash
+rc-service nginx status
+rc-service nginx reload       # prefer reload over restart when supported
+rc-service nginx restart
+rc-status                     # current runlevel
+rc-status --crashed           # crashed services
+rc-update add nginx default   # enable at boot
+rc-update show                # enabled services
+```
+
+⚠ OpenRC has no `journalctl`; service logs usually go to `/var/log/messages` (or the service's
+own log file). `rc-status --crashed` is the closest equivalent of `systemctl --failed`.
+
 **Finding Processes**
 
 ```bash
@@ -372,14 +387,23 @@ rpm -qf /etc/nginx/nginx.conf         # which package owns this file
 rpm -Va | head                        # verify package integrity (detect hand edits)
 dnf versionlock add nginx             # pin the version
 
+# Alpine
+apk update
+apk add nginx
+apk upgrade
+apk version -l '<'                    # packages behind the repository index
+apk info -W /etc/nginx/nginx.conf     # which package owns this file
+apk fix                               # repair package database / missing files
+
 # Cache cleanup (common during disk alerts)
 apt-get clean; apt-get autoclean
 dnf clean all
+rm -rf /var/cache/apk/*               # Alpine package cache
 ```
 
 ⚠ A non-interactive upgrade that hits a conffile conflict will **hang waiting for input**, and the whole batch job times out. Use `-o Dpkg::Options::=--force-confold` (keep the existing config) or `--force-confnew` (accept the new config); you must pick one explicitly.
 ⚠ `apt-get upgrade` may restart services and update the kernel. A kernel update only takes effect after a reboot, and a reboot is a high-risk operation.
-⚠ To decide which package manager to use: `command -v dnf || command -v yum`, or read `ID` from `/etc/os-release`.
+⚠ To decide which package manager to use: `command -v dnf || command -v yum || command -v apk`, or read `ID` from `/etc/os-release`. Alpine also needs `bash` installed (`apk add bash`) before this skill's script mode can run.
 
 ---
 

@@ -388,11 +388,11 @@ fi
 CHECK_CMD=""
 case "$RESTORE_PATH" in
   */nginx.conf|*/nginx/*.conf|*/sites-enabled/*|*/conf.d/*)
-    CHECK_CMD="${SUDO_PREFIX}nginx -t && ${SUDO_PREFIX}systemctl reload nginx" ;;
+    CHECK_CMD="${SUDO_PREFIX}nginx -t && { ${SUDO_PREFIX}systemctl reload nginx 2>/dev/null || ${SUDO_PREFIX}rc-service nginx reload; }" ;;
   */sshd_config)
-    CHECK_CMD="${SUDO_PREFIX}sshd -t && { ${SUDO_PREFIX}systemctl reload sshd 2>/dev/null || ${SUDO_PREFIX}systemctl reload ssh; }" ;;
+    CHECK_CMD="${SUDO_PREFIX}sshd -t && { ${SUDO_PREFIX}systemctl reload sshd 2>/dev/null || ${SUDO_PREFIX}systemctl reload ssh 2>/dev/null || ${SUDO_PREFIX}rc-service sshd reload; }" ;;
   *php-fpm*|*/php/*)
-    CHECK_CMD="${SUDO_PREFIX}php-fpm -t && ${SUDO_PREFIX}systemctl reload php-fpm" ;;
+    CHECK_CMD="${SUDO_PREFIX}php-fpm -t && { ${SUDO_PREFIX}systemctl reload php-fpm 2>/dev/null || ${SUDO_PREFIX}rc-service php-fpm reload; }" ;;
   *fstab)
     CHECK_CMD="${SUDO_PREFIX}findmnt --verify" ;;
 esac

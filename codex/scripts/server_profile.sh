@@ -57,7 +57,8 @@ done
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # 给可能慢的命令套上限。用法: RUN 5 docker ps
-if have timeout && timeout --version >/dev/null 2>&1; then
+# BusyBox 的 timeout 不支持 --version，用 `timeout 1 true` 探测真实可用性。
+if have timeout && timeout 1 true >/dev/null 2>&1; then
   RUN() { timeout "$@" 2>/dev/null; }
 else
   RUN() { shift; "$@" 2>/dev/null; }
@@ -80,12 +81,42 @@ want() {
 IS_ROOT=0
 [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && IS_ROOT=1
 
+# 服务管理器：systemd 需要能真正通信（容器里可能只有 systemctl 二进制），
+# 否则退回 OpenRC。Alpine 的 rc-status 不需要 systemd。
+INIT_SYSTEM="unknown"
+if have systemctl && RUN 3 systemctl show --property=Version >/dev/null 2>&1; then
+  INIT_SYSTEM="systemd"
+elif have rc-status; then
+  INIT_SYSTEM="openrc"
+fi
+
+# 地址枚举：BusyBox 的 ip 不支持 -brief，退回 `ip addr show` 解析。
+iface_dump() {
+  local t
+  t="$(RUN 5 ip -brief addr 2>/dev/null | head -1)"
+  case "$t" in
+    ''|*BusyBox*|*Usage:*)
+      RUN 5 ip addr show 2>/dev/null | awk '
+        /^[0-9]+: / {
+          iface=$2; sub(/:$/, "", iface); state="DOWN"
+          if ($3 ~ /UP/) state="UP"
+        }
+        /^[[:space:]]+inet6? / { printf "%s %s %s\n", iface, state, $2 }
+      '
+      ;;
+    *)
+      RUN 5 ip -brief addr 2>/dev/null
+      ;;
+  esac
+}
+
 # ══════════════════════════════ identity ══════════════════════════════
 if want identity; then
 
 K "profile_schema" "1"
 K "collected_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
 K "collected_by" "$(id -un 2>/dev/null) (uid=$(id -u 2>/dev/null))"
+K "init_system" "$INIT_SYSTEM"
 
 K "hostname" "$(hostname 2>/dev/null || echo unknown)"
 K "fqdn" "$(hostname -f 2>/dev/null || echo unknown)"
@@ -94,8 +125,12 @@ K "fqdn" "$(hostname -f 2>/dev/null || echo unknown)"
 # 这是"这台机器是哪台"最有意义的答案；ip_all 记全部地址，供按 IP 查档案时比对。
 # ip route get 只查路由表不发包。
 if have ip; then
-  K "ip_primary" "$(RUN 5 ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-  RUN 5 ip -brief addr 2>/dev/null | awk 'NR>0 && $1!="lo" && $2!="DOWN" {for(i=3;i<=NF;i++) if($i ~ /^[0-9a-fA-F.:]+\//) {sub(/\/.*/,"",$i); print $i}}' \
+  ip_primary="$(RUN 5 ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [ -z "$ip_primary" ]; then
+    ip_primary="$(RUN 5 ip route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  K "ip_primary" "$ip_primary"
+  iface_dump | awk '$1!="lo" && $2!="DOWN" {for(i=3;i<=NF;i++) if($i ~ /^[0-9a-fA-F.:]+\//) {sub(/\/.*/,"",$i); print $i}}' \
     | sort -u | head -10 \
     | while read -r a; do [ -n "$a" ] && L "ip_all" "$a"; done
 fi
@@ -121,6 +156,8 @@ if have timedatectl; then
   K "timezone" "$(RUN 3 timedatectl show -p Timezone --value 2>/dev/null)"
   sync="$(RUN 3 timedatectl show -p NTPSynchronized --value 2>/dev/null)"
   [ -n "$sync" ] && K "ntp_synced" "$sync"
+elif [ -r /etc/timezone ]; then
+  K "timezone" "$(head -1 /etc/timezone 2>/dev/null)"
 fi
 
 if [ -r /proc/uptime ]; then
@@ -141,9 +178,12 @@ if have needs-restarting && ! RUN 10 needs-restarting -r >/dev/null 2>&1; then
 fi
 
 # SSH 守护进程的单元名：Debian/Ubuntu 叫 ssh，RHEL 系叫 sshd。记下来省得以后猜。
-if have systemctl; then
+if [ "$INIT_SYSTEM" = "systemd" ]; then
   ssh_unit="$(RUN 5 systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
               | awk '{print $1}' | grep -m1 -E '^(sshd?|openssh-server)\.service$')"
+  [ -n "$ssh_unit" ] && K "ssh_unit" "$ssh_unit"
+elif [ "$INIT_SYSTEM" = "openrc" ]; then
+  ssh_unit="$(RUN 5 rc-service -l 2>/dev/null | grep -m1 -E '^ssh(d)?$')"
   [ -n "$ssh_unit" ] && K "ssh_unit" "$ssh_unit"
 fi
 
@@ -152,6 +192,7 @@ fi  # identity
 # ══════════════════════════════ hw ════════════════════════════════════
 if want hw; then
 
+lc=""
 if have lscpu; then
   lc="$(RUN 5 lscpu 2>/dev/null)"
   if [ -n "$lc" ]; then
@@ -171,11 +212,25 @@ if have lscpu; then
   fi
 fi
 # lscpu 缺席或非英文环境取不到时，用 /proc/cpuinfo 兜底（所有 Linux 都有）
-if [ -z "$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2)" ] && [ -r /proc/cpuinfo ]; then
-  K "cpu_model" "$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-)"
+if [ -r /proc/cpuinfo ]; then
+  if [ -z "$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2)" ]; then
+    K "cpu_model" "$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-)"
+  fi
+  # BusyBox/Alpine 没有 lscpu；从 /proc/cpuinfo 数线程、物理核、插槽。
+  if [ -z "$lc" ]; then
+    _threads="$(grep -c '^processor[[:space:]]*:' /proc/cpuinfo 2>/dev/null || true)"
+    [ "${_threads:-0}" -gt 0 ] && K "cpu_threads" "$_threads"
+    _cores="$(awk -F: '
+      /^physical id/ { p=$2; gsub(/[[:space:]]/, "", p) }
+      /^core id/     { c=$2; gsub(/[[:space:]]/, "", c); if (p != "") seen[p ":" c]=1 }
+      END { n=0; for (k in seen) n++; print n }
+    ' /proc/cpuinfo 2>/dev/null)"
+    [ "${_cores:-0}" -gt 0 ] || _cores="$_threads"
+    [ "${_cores:-0}" -gt 0 ] && K "cpu_cores" "$_cores"
+    _sockets="$(awk -F: '/^physical id/ {gsub(/[[:space:]]/, "", $2); print $2}' /proc/cpuinfo 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+    [ "${_sockets:-0}" -gt 0 ] && K "cpu_sockets" "$_sockets"
+  fi
 fi
-# 物理核数：lscpu 拿不到时数 /proc/cpuinfo 里唯一的 (physical id, core id) 组合
-if [ ! -r /proc/cpuinfo ]; then :; fi
 
 if [ -r /proc/meminfo ]; then
   K "mem_total_mb"  "$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0) / 1024 ))"
@@ -201,7 +256,27 @@ if have lsblk; then
     | while read -r nm sz ty ro model; do
         L "disk_dev" "${nm}|${sz:-?}|${ty:-disk}|rota=${ro:-?}|${model:-}"
       done
+elif [ -d /sys/block ]; then
+  # BusyBox/Alpine 没有 lsblk；/sys/block 足够给出磁盘清单。
+  for _b in /sys/block/*; do
+    [ -d "$_b" ] || continue
+    _nm="${_b##*/}"
+    case "$_nm" in loop*|ram*|zram*|dm-*|sr*) continue ;; esac
+    _sec="$(cat "$_b/size" 2>/dev/null || echo 0)"
+    _bytes=$(( _sec * 512 ))
+    _rota="$(cat "$_b/queue/rotational" 2>/dev/null || echo '?')"
+    _model="$(head -1 "$_b/device/model" 2>/dev/null | tr -d '\n')"
+    L "disk_dev" "${_nm}|${_bytes}|disk|rota=${_rota}|${_model}"
+  done
 fi
+
+emit_mounts() {
+  while read -r src fst sz usd av pct tgt; do
+    case "$fst" in tmpfs|devtmpfs|proc|sysfs|cgroup*|squashfs|devpts|mqueue|hugetlbfs|tracefs|debugfs|bpf|securityfs|pstore|configfs|fusectl|ramfs) continue ;; esac
+    case "$tgt" in /proc*|/sys*|/dev*|/run/*) continue ;; esac
+    [ -n "$tgt" ] && L "fs_mount" "${tgt}|${fst:-?}|${sz:-?}|${usd:-?}|${av:-?}|pct=${pct:-?}|src=${src:-?}"
+  done
+}
 
 if have findmnt; then
   # findmnt 读 /proc/self/mountinfo，不实际探测设备，僵死 NFS 不会卡住
@@ -212,11 +287,13 @@ if have findmnt; then
         L "fs_mount" "${tgt}|${fst:-?}|${sz:-?}|${usd:-?}|${av:-?}|src=${src:-?}"
       done
 elif have df; then
-  # -l 只看本地文件系统：不带它，僵死的 NFS 挂载点会让 df 阻塞数分钟
-  RUN 10 df -lPT -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | tail -n +2 | head -30 \
-    | while read -r src fst sz usd av pct tgt; do
-        L "fs_mount" "${tgt}|${fst}|${sz}|${usd}|${av}|pct=${pct}|src=${src}"
-      done
+  # -l 只看本地文件系统：不带它，僵死的 NFS 挂载点会让 df 阻塞数分钟。
+  # BusyBox df 不支持 -l/-x，用 -PT 并按类型过滤。
+  if RUN 10 df -lPT 2>/dev/null | head -1 | grep -q '^Filesystem'; then
+    RUN 10 df -lPT 2>/dev/null | tail -n +2 | head -30 | emit_mounts
+  else
+    RUN 10 df -PT 2>/dev/null | tail -n +2 | head -30 | emit_mounts
+  fi
 fi
 
 # 累计扇区数：存成基线，下次采集相减就能算出这段时间的 IO 活动量，零成本。
@@ -237,9 +314,9 @@ fi  # storage
 if want network; then
 
 if have ip; then
-  RUN 5 ip -br addr 2>/dev/null | head -20 \
+  iface_dump | head -20 \
     | while IFS=' ' read -r iface state addrs; do
-        L "net_iface" "${iface}|state=${state:-?}|${addrs:-}"
+        [ -n "$iface" ] && L "net_iface" "${iface}|state=${state:-?}|${addrs:-}"
       done
   K "gateway" "$(RUN 5 ip route 2>/dev/null | awk '/^default/{print $3; exit}')"
 fi
@@ -249,6 +326,11 @@ if have ss; then
   RUN 5 ss -lntH 2>/dev/null | awk '{print $1"|"$4}' | sort -u | head -40 \
     | while IFS='|' read -r proto local; do
         L "listen" "${proto}|${local}"
+      done
+elif have netstat; then
+  RUN 5 netstat -lntu 2>/dev/null | awk 'NR>2 {print $1"|"$4}' | sort -u | head -40 \
+    | while IFS='|' read -r proto local; do
+        [ -n "$proto" ] && [ -n "$local" ] && L "listen" "${proto}|${local}"
       done
 fi
 
@@ -310,7 +392,7 @@ fi  # docker
 # ══════════════════════════════ services ══════════════════════════════
 if want services; then
 
-if have systemctl; then
+if [ "$INIT_SYSTEM" = "systemd" ]; then
   RUN 8 systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null \
     | awk '{print $1}' | head -80 \
     | while read -r u; do L "unit_running" "$u"; done
@@ -325,11 +407,23 @@ if have systemctl; then
     | while IFS='|' read -r unit next; do
         [ -n "$unit" ] && L "timer" "${unit}|next=${next}"
       done
+elif [ "$INIT_SYSTEM" = "openrc" ]; then
+  # Alpine/OpenRC：rc-status --servicelist 的每行形如
+  #   nginx    [  started  ]
+  RUN 8 rc-status --servicelist 2>/dev/null \
+    | awk '/\[[[:space:]]*started[[:space:]]*\]/ {print $1}' | head -80 \
+    | while read -r u; do [ -n "$u" ] && L "unit_running" "$u"; done
+
+  RUN 8 rc-status --crashed 2>/dev/null | head -20 \
+    | while read -r u; do [ -n "$u" ] && L "unit_failed" "${u}|crashed"; done
+
+  RUN 8 rc-update show 2>/dev/null | head -40 \
+    | while read -r u rest; do [ -n "$u" ] && L "openrc_enabled" "${u}|${rest:-}"; done
 fi
 
 # cron 入口数量（只数文件，不读内容）
 n=0
-for d in /var/spool/cron /var/spool/cron/crontabs /etc/cron.d; do
+for d in /var/spool/cron /var/spool/cron/crontabs /etc/cron.d /etc/crontabs; do
   [ -d "$d" ] && n=$(( n + $(RUN 3 ls -1 "$d" 2>/dev/null | grep -c .) ))
 done
 K "cron_entries" "$n"
@@ -337,6 +431,7 @@ K "cron_entries" "$n"
 if have apt-get; then   K "pkg_manager" "apt"
 elif have dnf; then     K "pkg_manager" "dnf"
 elif have yum; then     K "pkg_manager" "yum"
+elif have apk; then     K "pkg_manager" "apk"
 elif have zypper; then  K "pkg_manager" "zypper"
 elif have pacman; then  K "pkg_manager" "pacman"
 fi
@@ -378,9 +473,22 @@ elif [ "$IS_ROOT" = "1" ] && have firewall-cmd; then
   fi
   fw_done=1
 fi
+# Alpine 常用 nftables；也覆盖直接维护 iptables 的主机。
+if [ "$IS_ROOT" = "1" ] && [ "$fw_done" = "0" ] && have nft; then
+  if RUN 5 nft list ruleset >/dev/null 2>&1; then
+    K "firewall" "nftables rules=$(RUN 5 nft list ruleset 2>/dev/null | grep -cE '^[[:space:]]*(table|chain|rule)')"
+    fw_done=1
+  fi
+fi
+if [ "$IS_ROOT" = "1" ] && [ "$fw_done" = "0" ] && have iptables; then
+  if RUN 5 iptables -S >/dev/null 2>&1; then
+    K "firewall" "iptables rules=$(RUN 5 iptables -S 2>/dev/null | grep -cE '^(-A|-P|-N)')"
+    fw_done=1
+  fi
+fi
 if [ "$fw_done" = "0" ]; then
   if have ufw || have firewall-cmd || have iptables || have nft; then
-    K "firewall" "unknown reason=needs_root（检测到防火墙工具但当前用户读不到状态）"
+    K "firewall" "unknown reason=unreadable（检测到防火墙工具，但读不到生效规则：需要 root、权限不足，或 daemon 未运行）"
   else
     K "firewall" "absent"
   fi

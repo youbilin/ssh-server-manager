@@ -1,7 +1,7 @@
 ---
 name: ssh-server-manager
 description: Use when the user wants to connect to, inspect, deploy to, or troubleshoot a remote Linux server over SSH, even when they never say SSH. Supports account+password login — no key setup needed first. Trigger on Chinese phrases such as ssh 登录, 远程服务器, 登录服务器, 用账号密码登录, 密码登录, 运维, 部署上线, 重启服务, 查日志, 服务器挂了, 网站 502, 磁盘满了, CPU 跑满, 服务器信息, 硬件信息, 服务器画像, 这台机器什么配置, 对比服务器, 第一次连这台, 批量执行, 多台机器, 上传下载文件, 跳板机, 免密登录; and English phrases such as ssh into, remote server, server ops, deploy to prod, restart nginx, tail the logs, check server health, disk space, firewall rules, batch run across hosts, password login, server inventory, hardware specs. Do not trigger for local-only shell work, container orchestration with no remote host, or code review. Covers password/key auth, cached per-host profiles (hardware, Docker services, disk baseline), connectivity debugging, health checks, process/service management, logs, file transfer, package/Docker deploys, firewall/user administration, and batch operations across hosts.
-compatibility: Local machine needs ssh, scp (rsync optional), and bash 4+. Password login uses ssh's built-in SSH_ASKPASS — no sshpass required. python3 is optional and only used to parse multi-host inventories. Target hosts must be Linux (Ubuntu/Debian/CentOS/Rocky/Alma); scripts execute remotely via `bash -s`.
+compatibility: Local machine needs ssh, scp (rsync optional), and bash 4+. Password login uses ssh's built-in SSH_ASKPASS — no sshpass required. python3 is optional and only used to parse multi-host inventories. Target hosts must be Linux; systemd distributions (Ubuntu/Debian/CentOS/Rocky/Alma) are supported, and Alpine/OpenRC works when bash is installed (`apk add bash`). Scripts execute remotely via `bash -s`.
 ---
 
 # SSH Server Operations
@@ -281,10 +281,11 @@ reboot.
 
 ## First-Contact Collection: Read the Specs, Run No Benchmarks
 
-On first contact, get the whole picture in one pass: OS/kernel/virtualization, CPU model and
-core count, memory, disks and filesystems, NICs and listening ports, Docker and every
-container, systemd services and timers, runtime versions, firewall and effective sshd config,
-accounts with a login shell.
+On first contact, get the whole picture in one pass: OS/kernel/virtualization, init/service
+manager, CPU model and core count, memory, disks and filesystems, NICs and listening ports,
+Docker and every container, systemd or OpenRC services, runtime versions, firewall and
+effective sshd config, accounts with a login shell. On Alpine/OpenRC the collector uses
+`/sys/block`, `df`, BusyBox `ip`/`netstat`, and `rc-status`/`rc-update`; bash is required.
 
 ### ⛔ Never Run Benchmarks or Stress Tests on a Server
 
@@ -377,10 +378,10 @@ scripts/ssh_exec.sh -H web1 -f scripts/health_check.sh -A "--deep --updates" -t 
 
 Coverage: OS and kernel version, uptime, CPU and load (normalized by core count), memory and
 swap, disk and inode usage (with threshold verdicts), listening ports and connection states,
-failed systemd units, SELinux/AppArmor, firewall state, effective SSH config, recent logins,
-Docker container health (only Exited/Restarting/unhealthy are flagged; a plain `Up 2 hours`
-container without a healthcheck is normal). It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which
-batch runs can grep directly.
+failed systemd units or crashed OpenRC services, SELinux/AppArmor, firewall state, effective
+SSH config, recent logins, Docker container health (only Exited/Restarting/unhealthy are
+flagged; a plain `Up 2 hours` container without a healthcheck is normal). It ends with
+`SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs can grep directly.
 
 Thresholds can be passed through the wrapper's `-A`:
 
@@ -414,11 +415,22 @@ systemctl list-timers --all              # systemd timers
 ps -eo pid,ppid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -15
 ```
 
-- When a service won't start, read `journalctl -u <svc> -n 100` first. The usual causes are a
+```bash
+# OpenRC / Alpine (no journalctl, no systemctl)
+rc-service nginx status
+rc-service nginx reload          # prefer reload; fall back to restart
+rc-status --crashed              # closest equivalent of systemctl --failed
+rc-update show                   # enabled services
+tail -n 200 /var/log/messages
+```
+
+- When a service won't start, read `journalctl -u <svc> -n 100` first (on OpenRC: the
+  service's log and `/var/log/messages`). The usual causes are a
   port already in use, a config syntax error, permissions or SELinux, or a dependency not
   running — work through section 4 of `references/troubleshooting.md` item by item.
 - `ps` `%cpu` is an average over the process's lifetime. For an instantaneous hotspot use
-  `top -b -n1` or `pidstat`, or you will miss processes that just started.
+  `top -b -n1` or `pidstat`, or you will miss processes that just started. BusyBox `ps` does
+  not support `%cpu`; `top -b -n1` is the portable fallback on Alpine.
 - Send `kill -15` (TERM, giving the process a chance to clean up) first; use `-9` only when
   that fails. `kill -9` against databases and file servers can lose data or leave lock files.
 - Back up crontab before editing: `crontab -l > ~/cron.bak`. `crontab -r` wipes it with no
@@ -476,8 +488,11 @@ rsync -avz --partial -e 'ssh -p 2222' deploy@web1:/srv/app/logs/ ./logs/
 ## 6. Software and Deployment
 
 - Choose the package manager by distribution: `apt-get` on Debian-family, `dnf` on RHEL-family
-  (`yum` on CentOS 7 and older). Detect with `command -v dnf || command -v yum`, or read
-  `/etc/os-release`.
+  (`yum` on CentOS 7 and older), `apk` on Alpine. Detect with `command -v dnf || command -v yum`
+  / `command -v apk`, or read `/etc/os-release`.
+- On OpenRC hosts (Alpine), use `rc-service nginx restart` / `rc-status` instead of
+  `systemctl`; enable at boot with `rc-update add nginx default`. There is no `journalctl`;
+  logs are usually under `/var/log/messages`.
 - Look before you leap: `apt-get install -s <pkg>` (simulate), `dnf list updates`,
   `apt list --upgradable`.
 - **Patch updates are mutating or even dangerous**: `apt-get upgrade` can restart services,
@@ -611,7 +626,7 @@ Summarize in this structure at the end of each operations task:
 ```
 ## Server Portrait
 <Give this on first contact (≤20 lines): OS/kernel/virtualization, CPU model, memory, chassis,
-primary IP, Docker container count, running systemd service count, latency, profile timestamp.
+primary IP, Docker container count, running systemd/OpenRC service count, latency, profile timestamp.
 Generate with profile_store show --short; do not dump the whole profile into the conversation>
 
 ## Goal

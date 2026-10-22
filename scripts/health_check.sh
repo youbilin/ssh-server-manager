@@ -17,6 +17,8 @@
 #   bash health_check.sh --strict        # 有 WARN/CRIT 时以非零码退出（供批量脚本判定）
 #   bash health_check.sh --disk-warn 75 --disk-crit 85 --load-warn 1.5
 #
+# 服务检查支持 systemd 与 OpenRC；包更新检查支持 apt/dnf/yum/apk。
+#
 # 通过 ssh_exec.sh 调用:
 #   ./ssh_exec.sh -H web1 -f ./health_check.sh -t 180
 #   ./ssh_exec.sh -H web1 -f ./health_check.sh -A "--disk-warn 75" -t 180
@@ -104,6 +106,23 @@ unset _s _ifs
 
 # ---------- 基础 helpers ----------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+show_addrs() {
+  local t
+  t="$(ip -brief addr 2>/dev/null | head -1)"
+  case "$t" in
+    ''|*BusyBox*|*Usage:*) ip addr show 2>/dev/null ;;
+    *) ip -brief addr 2>/dev/null ;;
+  esac
+}
+
+# systemd 需要真正可通信；只有二进制不算（容器/Chroot 常见）。
+SERVICE_MANAGER=""
+if have systemctl && { ! have timeout || timeout 3 systemctl show --property=Version >/dev/null 2>&1; }; then
+  SERVICE_MANAGER="systemd"
+elif have rc-status; then
+  SERVICE_MANAGER="openrc"
+fi
 
 SEC() { printf '\n=== %s ===\n' "$1"; }
 KV()  { printf '  %-26s %s\n' "$1" "$2"; }
@@ -206,10 +225,13 @@ else
 fi
 if have ps; then
   NOTE "按 CPU 排序的进程:"
-  if ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu >/dev/null 2>&1; then
+  if ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu 2>/dev/null | head -1 | grep -q '%CPU'; then
     ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu 2>/dev/null | head -6 | sed 's/^/    /'
+  elif have top && top -b -n1 >/dev/null 2>&1; then
+    # BusyBox ps 不提供 %CPU；top -b 在各家 BusyBox/coreutils 上都能给出快照。
+    top -b -n1 2>/dev/null | head -8 | sed 's/^/    /'
   else
-    ps aux 2>/dev/null | sort -k3 -rn | head -6 | sed 's/^/    /'
+    ps aux 2>/dev/null | head -6 | sed 's/^/    /'
   fi
 fi
 fi
@@ -258,8 +280,10 @@ else
 fi
 if have ps; then
   NOTE "按内存排序的进程:"
-  if ps -eo pid,user,%cpu,%mem,rss,cmd --sort=-%mem >/dev/null 2>&1; then
+  if ps -eo pid,user,%cpu,%mem,rss,cmd --sort=-%mem 2>/dev/null | head -1 | grep -q '%MEM'; then
     ps -eo pid,user,%cpu,%mem,rss,cmd --sort=-%mem 2>/dev/null | head -6 | sed 's/^/    /'
+  elif ps -o pid,user,rss,args 2>/dev/null | head -1 | grep -q 'RSS'; then
+    ps -o pid,user,rss,args 2>/dev/null | sort -k3 -rn | head -6 | sed 's/^/    /'
   else
     ps aux 2>/dev/null | sort -k4 -rn | head -6 | sed 's/^/    /'
   fi
@@ -282,6 +306,8 @@ if have df; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       u=$(printf '%s' "$line" | awk '{gsub(/%/,"",$1); print $1}')
+      case "$u" in ''|*[!0-9]*) NOTE "    （无法解析使用率，已忽略: $line）"; continue ;; esac
+      if [ "$u" -gt 100 ]; then NOTE "    （使用率异常（$u%），已忽略: $line）"; continue; fi
       if cmp_ge "${u:-0}" "$DISK_CRIT"; then
         flag CRIT "磁盘告急：$line"
       else
@@ -301,6 +327,8 @@ if have df; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       u=$(printf '%s' "$line" | awk '{gsub(/%/,"",$1); print $1}')
+      case "$u" in ''|*[!0-9]*) NOTE "    （无法解析 inode 使用率，已忽略: $line）"; continue ;; esac
+      if [ "$u" -gt 100 ]; then NOTE "    （inode 使用率异常（$u%），已忽略: $line）"; continue; fi
       if cmp_ge "${u:-0}" "$INODE_CRIT"; then
         flag CRIT "inode 告急：$line（会导致无法创建新文件，即使磁盘还有空间）"
       else
@@ -351,7 +379,7 @@ elif have netstat; then
 else
   UNAVAIL "ports" "缺少 ss 与 netstat"
 fi
-have ip && { NOTE "地址与路由:"; ip -brief addr 2>/dev/null | sed 's/^/    /'; ip route 2>/dev/null | head -5 | sed 's/^/    /'; }
+have ip && { NOTE "地址与路由:"; show_addrs | sed 's/^/    /'; ip route 2>/dev/null | head -5 | sed 's/^/    /'; }
 if [ -r /etc/resolv.conf ]; then
   KV "dns" "$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf)"
 fi
@@ -364,25 +392,44 @@ fi
 # ---------- 6. 服务与定时任务 ----------
 if want services; then
 SEC "SERVICES / 服务"
-if have systemctl; then
-  failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | head -15)"
-  if [ -n "$failed" ]; then
-    NOTE "失败的 systemd 单元:"
-    printf '%s\n' "$failed" | sed 's/^/    /'
-    n=$(printf '%s\n' "$failed" | grep -c .)
-    flag CRIT "有 ${n} 个 systemd 单元处于 failed 状态"
-  else
-    KV "systemd failed units" "0"
-  fi
-  KV "running units" "$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | grep -c .)"
-  NOTE "systemd timers:"
-  systemctl list-timers --all --no-legend --no-pager 2>/dev/null | head -8 | sed 's/^/    /'
-else
-  UNAVAIL "systemd" "非 systemd 系统"
-fi
-if have crontab || [ -d /etc/cron.d ]; then
+KV "init system" "${SERVICE_MANAGER:-unknown}"
+case "$SERVICE_MANAGER" in
+  systemd)
+    failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | head -15)"
+    if [ -n "$failed" ]; then
+      NOTE "失败的 systemd 单元:"
+      printf '%s\n' "$failed" | sed 's/^/    /'
+      n=$(printf '%s\n' "$failed" | grep -c .)
+      flag CRIT "有 ${n} 个 systemd 单元处于 failed 状态"
+    else
+      KV "systemd failed units" "0"
+    fi
+    KV "running units" "$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | grep -c .)"
+    NOTE "systemd timers:"
+    systemctl list-timers --all --no-legend --no-pager 2>/dev/null | head -8 | sed 's/^/    /'
+    ;;
+  openrc)
+    KV "OpenRC running services" "$(rc-status --servicelist 2>/dev/null | grep -c '\[.*started.*\]')"
+    failed="$(rc-status --crashed 2>/dev/null | head -15)"
+    if [ -n "$failed" ]; then
+      NOTE "crashed OpenRC services:"
+      printf '%s\n' "$failed" | sed 's/^/    /'
+      n=$(printf '%s\n' "$failed" | grep -c .)
+      flag CRIT "有 ${n} 个 OpenRC 服务处于 crashed 状态"
+    else
+      KV "OpenRC crashed services" "0"
+    fi
+    NOTE "OpenRC enabled services:"
+    rc-update show 2>/dev/null | head -10 | sed 's/^/    /'
+    NOTE "timers: OpenRC 不使用 systemd timers；定时任务见下方 cron 计数"
+    ;;
+  *)
+    UNAVAIL "services" "未检测到可用的 systemd 或 OpenRC"
+    ;;
+esac
+if have crontab || [ -d /etc/cron.d ] || [ -d /etc/crontabs ]; then
   n=0
-  for d in /var/spool/cron /var/spool/cron/crontabs; do
+  for d in /var/spool/cron /var/spool/cron/crontabs /etc/crontabs; do
     [ -d "$d" ] && n=$((n + $(ls -1 "$d" 2>/dev/null | wc -l)))
   done
   n=$((n + $(ls -1 /etc/cron.d 2>/dev/null | wc -l)))
@@ -417,6 +464,13 @@ if have iptables; then
     KV "iptables 规则数" "$(iptables -S 2>/dev/null | wc -l)"
   else
     KV "iptables 规则数" "未知（需要 root 才能读取）"
+  fi
+fi
+if have nft; then
+  if nft list ruleset >/dev/null 2>&1; then
+    KV "nftables 规则数" "$(nft list ruleset 2>/dev/null | grep -cE '^[[:space:]]*(table|chain|rule)')"
+  else
+    KV "nftables 规则数" "未知（需要 root 才能读取）"
   fi
 fi
 case "$fw" in
@@ -520,6 +574,11 @@ if have apt-get; then
 elif have dnf || have yum; then
   pm=$(have dnf && echo dnf || echo yum)
   KV "可更新软件包" "$($pm -q check-update 2>/dev/null | grep -c '^[a-zA-Z0-9]' || true)"
+elif have apk; then
+  # apk 没有独立的 security 通道；先看本地索引里版本落后于仓库的包。
+  n=$(apk version -l '<' 2>/dev/null | awk 'NR>1 && $0 ~ /</ {c++} END{print c+0}')
+  KV "可更新软件包" "${n:-0}（需要先 apk update 才有完整索引）"
+  KV "其中安全更新" "未知（apk 不单独标记安全更新）"
 else
   UNAVAIL "updates" "未知包管理器"
 fi

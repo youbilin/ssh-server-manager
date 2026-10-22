@@ -216,12 +216,12 @@ REPEAT_KEYS=" ip_all alias "
 is_list_key() { case "$LIST_KEYS" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 KEY_SECTION_PATTERNS="
-identity:profile_schema collected_at collected_by hostname fqdn kernel arch virt os os_id os_version machine_id boot_id uptime_s boot_time ip_primary ip_all ip6_primary reboot_required selinux apparmor timezone ntp_synced ssh_unit
+identity:profile_schema collected_at collected_by init_system hostname fqdn kernel arch virt os os_id os_version machine_id boot_id uptime_s boot_time ip_primary ip_all ip6_primary reboot_required selinux apparmor timezone ntp_synced ssh_unit
 hw:cpu_ mem_total_mb swap_total_mb gpu
 storage:disk_dev diskstat fs_mount
 network:gateway listen net_iface dns
 docker:docker
-services:cron_entries pkg_manager unit_running unit_failed timer
+services:cron_entries pkg_manager unit_running unit_failed timer openrc_enabled
 runtimes:python3 node php java go ruby nginx mysqld redis postgres_client
 security:firewall ssh_ user_shell
 "
@@ -701,6 +701,7 @@ do_show_short() { # $1 = profile file
   }
   line "os"           "系统"
   line "kernel"       "内核"
+  line "init_system"  "服务管理"
   line "virt"         "虚拟化"
   line "cpu_model"    "CPU"
   line "mem_total_mb" "内存MB"

@@ -13,6 +13,10 @@ Three properties of remote operations drive every rule below:
 2. **Breaking SSH or network config locks you out.** A bad `sshd_config`, `iptables -F`, or a default DROP policy means your only way back in is the cloud console's VNC. Keep an escape hatch before touching any of that.
 3. **Batch operations multiply mistakes.** One command across 1 host is a change; across 50 it is an incident. So always be able to print the exact target list first.
 
+**Targets:** systemd Linux (Ubuntu/Debian/RHEL/CentOS/Rocky/Alma) is the default. Alpine/OpenRC
+also works once `bash` is installed on the target (`apk add bash`); the collector falls back to
+BusyBox `ip`/`df`/`netstat`, `/proc`, `/sys/block`, and `rc-status`/`rc-update`.
+
 ## Safety Rules
 
 ### Credentials
@@ -258,7 +262,7 @@ reboot.
 
 On first contact, get the whole picture in one pass: OS/kernel/virtualization, CPU model and
 core count, memory, disks and filesystems, NICs and listening ports, Docker and every
-container, systemd services and timers, runtime versions, firewall and effective sshd config,
+container, systemd or OpenRC services, runtime versions, firewall and effective sshd config,
 accounts with a login shell.
 
 ### ⛔ Never Run Benchmarks or Stress Tests on a Server
@@ -348,10 +352,11 @@ bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.s
 
 Coverage: OS and kernel version, uptime, CPU and load (normalized by core count), memory and
 swap, disk and inode usage (with threshold verdicts), listening ports and connection states,
-failed systemd units, SELinux/AppArmor, firewall state, effective SSH config, recent logins,
-Docker container health (only Exited/Restarting/unhealthy are flagged; a running container
-without a healthcheck is normal). It ends with `SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs
-can grep directly. Pass thresholds through the wrapper:
+failed systemd units or crashed OpenRC services, SELinux/AppArmor, firewall state, effective
+SSH config, recent logins, Docker container health (only Exited/Restarting/unhealthy are
+flagged; a running container without a healthcheck is normal). It ends with
+`SSHMGR_VERDICT=OK|WARN|CRIT`, which batch runs can grep directly. Pass thresholds through the
+wrapper:
 
 ```bash
 bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.sh \
@@ -383,11 +388,22 @@ systemctl list-timers --all              # systemd timers
 ps -eo pid,ppid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -15
 ```
 
-- When a service won't start, read `journalctl -u <svc> -n 100` first. The usual causes are a
+```bash
+# OpenRC / Alpine (no journalctl, no systemctl)
+rc-service nginx status
+rc-service nginx reload          # prefer reload; fall back to restart
+rc-status --crashed              # closest equivalent of systemctl --failed
+rc-update show                   # enabled services
+tail -n 200 /var/log/messages
+```
+
+- When a service won't start, read `journalctl -u <svc> -n 100` first (on OpenRC: the
+  service's log and `/var/log/messages`). The usual causes are a
   port already in use, a config syntax error, permissions or SELinux, or a dependency not
   running — work through section 4 of `references/troubleshooting.md` item by item.
 - `ps` `%cpu` is an average over the process's lifetime. For an instantaneous hotspot use
-  `top -b -n1` or `pidstat`, or you will miss processes that just started.
+  `top -b -n1` or `pidstat`, or you will miss processes that just started. BusyBox `ps` does
+  not support `%cpu`; `top -b -n1` is the portable fallback on Alpine.
 - Send `kill -15` (TERM, giving the process a chance to clean up) first; use `-9` only when
   that fails. `kill -9` against databases and file servers can lose data or leave lock files.
 - Back up crontab before editing: `crontab -l > ~/cron.bak`. `crontab -r` wipes it with no
@@ -445,8 +461,11 @@ rsync -avz --partial -e 'ssh -p 2222' deploy@web1:/srv/app/logs/ ./logs/
 ## 6. Software and Deployment
 
 - Choose the package manager by distribution: `apt-get` on Debian-family, `dnf` on RHEL-family
-  (`yum` on CentOS 7 and older). Detect with `command -v dnf || command -v yum`, or read
-  `/etc/os-release`.
+  (`yum` on CentOS 7 and older), `apk` on Alpine. Detect with `command -v dnf || command -v yum`
+  / `command -v apk`, or read `/etc/os-release`.
+- On OpenRC hosts (Alpine), use `rc-service nginx restart` / `rc-status` instead of
+  `systemctl`; enable at boot with `rc-update add nginx default`. There is no `journalctl`;
+  logs are usually under `/var/log/messages`.
 - Look before you leap: `apt-get install -s <pkg>` (simulate), `dnf list updates`,
   `apt list --upgradable`.
 - **Patch updates are mutating or even dangerous**: `apt-get upgrade` can restart services,
@@ -719,7 +738,7 @@ Summarize in this structure at the end of each operations task:
 ```
 ## Server Portrait
 <Give this on first contact (≤20 lines): OS/kernel/virtualization, CPU model, memory, chassis,
-primary IP, Docker container count, running systemd service count, latency, profile timestamp.
+primary IP, Docker container count, running systemd/OpenRC service count, latency, profile timestamp.
 Generate with profile_store show --short; do not dump the whole profile into the conversation>
 
 ## Goal

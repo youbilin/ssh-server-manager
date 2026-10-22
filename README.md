@@ -53,7 +53,7 @@ mechanism, because a one-off login should not require generating a key pair firs
 | 🧭 | Risk tiering | Read-only / mutating / dangerous; tier 2 requires `--confirm-danger`, tier 1 warns with blast radius |
 | 📝 | Audit log | `timestamp \| host \| tier \| exit code \| duration \| command`, escaped and appended by the wrapper itself |
 | 🗂 | Server profiles | One-time collection of slow-moving facts; fingerprint-first identity; per-port files; local `compare` |
-| 🩺 | One-shot inspection | Structured report ending in `SSHMGR_VERDICT=OK\|WARN\|CRIT`; thresholds pass via `-A "--disk-warn 75"` |
+| 🩺 | One-shot inspection | Structured report ending in `SSHMGR_VERDICT=OK\|WARN\|CRIT`; thresholds pass via `-A "--disk-warn 75"`; systemd and OpenRC service checks |
 | 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; `--selftest` validates the local environment |
 | 🚫 | Benchmark refusal | `sysbench`/`fio`/`stress-ng`/`iperf3` are tier 2 by default — load tests on production corrupt metrics and can OOM a host |
 | 🧯 | Config-change protocol | Backup → syntax check → rollback timer → verify in a second session; the printed restore line already carries the ssh prefix |
@@ -71,7 +71,11 @@ mechanism, because a one-off login should not require generating a key pair firs
 **Target hosts**
 
 - Linux with systemd — Ubuntu/Debian, RHEL/CentOS/Rocky/Alma
-- `bash` on the remote side; scripts are piped in as `ssh host bash -s`
+- Alpine/OpenRC is supported when `bash` is installed on the target (`apk add bash`); the
+  remote scripts are piped in as `ssh host bash -s`, so ash-only Alpine fails the preflight
+  with an explicit message
+- Service inspection supports systemd and OpenRC; package inspection/updates support
+  apt/dnf/yum and apk
 
 **Windows**
 
@@ -286,7 +290,8 @@ is created with `umask 077`. `set --note "..."` updates the note; collector-main
 ### `server_profile.sh` — remote collector
 
 Runs on the target host and is normally invoked through `profile_store.sh`. Read-only; the
-`# sshmgr:read-only` marker in its header is what exempts it from the mutating tier.
+`# sshmgr:read-only` marker in its header is what exempts it from the mutating tier. It records
+`init_system=systemd|openrc` and supports Alpine/OpenRC when bash is installed.
 
 ### `tcping.sh` — local latency probe
 
@@ -394,10 +399,12 @@ bash tests/run.sh
 ```
 
 The suite needs no network and no real host: fake `ssh`, `ssh-keyscan` and `docker` are used,
-with host keys generated locally. It covers risk classification, dry-run/selftest side effects, credential temp
-files, exact host-key matching, profile port/lookup/stale/identity behavior, restore-command
-generation, Docker health classification, and batch confirmation/stop behavior. CI runs the same
-suite on Ubuntu, macOS and Windows (Git-Bash), plus `shellcheck` and a Codex-copy sync check.
+with host keys generated locally. It covers risk classification, dry-run/selftest side effects,
+credential temp files, exact host-key matching, profile port/lookup/stale/identity behavior,
+restore-command generation, Docker health classification, batch confirmation/stop behavior, and
+systemd/OpenRC service detection. CI runs the same suite on Ubuntu, macOS and Windows (Git-Bash),
+plus `shellcheck`, a BSD/onetrue-awk profile pass, and a Codex-copy sync check. Alpine/OpenRC
+targets need `bash` installed (`apk add bash`).
 
 ## Contributing
 

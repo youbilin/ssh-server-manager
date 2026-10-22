@@ -29,6 +29,7 @@ assert_contains "cp -p --" "$out" "restore must copy on the remote side"
 assert_contains "ssh" "$out" "restore must include an ssh prefix"
 assert_contains "example.invalid" "$out" "restore must name the target host"
 assert_contains "nginx -t" "$out" "restore should print the syntax check"
+assert_contains "rc-service nginx reload" "$out" "restore should fall back to OpenRC"
 assert_eq "1" "$(find "$HOME/.config-backups" -name 'nginx.conf.*.bak' 2>/dev/null | wc -l | tr -d ' ')" "one backup file expected"
 
 CURRENT_TEST="restore command carries port and jump"

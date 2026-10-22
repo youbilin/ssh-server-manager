@@ -167,7 +167,16 @@ line="$(tail -1 "$SSHMGR_HOME/audit.log" 2>/dev/null)"
 assert_contains "tier0" "$line" "audit line tier"
 assert_contains 'echo a\|b' "$line" "audit line must escape pipes"
 
-# 10. Usage guards.
+# 10. Script mode preflights bash and gives an Alpine-specific message.
+CURRENT_TEST="missing remote bash"
+out="$(FAKE_SSH_NO_BASH=1 bash "$SSH_EXEC" -H example.invalid --auth key \
+  -f "$ROOT_DIR/scripts/health_check.sh" 2>&1)"
+rc=$?
+assert_rc 2 "$rc" "missing bash rc"
+assert_contains "apk add bash" "$out" "Alpine guidance"
+assert_contains "没有 bash" "$out" "missing bash message"
+
+# 11. Usage guards.
 CURRENT_TEST="usage guards"
 out="$(sv --fingerprint 'SHA256:x' -H h -c true)"
 assert_contains "只能配合" "$out" "fingerprint without accept/show should be rejected"
