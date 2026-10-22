@@ -1,7 +1,7 @@
 interface:
   display_name: "SSH Server Manager"
-  short_description: "Safe SSH ops for Linux servers"
-  default_prompt: "Connect to the target server over SSH, do read-only reconnaissance first, and report findings before changing anything remotely."
+  short_description: "Safety-first SSH operations for Linux servers"
+  default_prompt: "Connect to the target Linux server over SSH. Start with read-only reconnaissance and a cached profile, report the findings clearly, and ask for explicit confirmation before any mutating action."
 
 policy:
   allow_implicit_invocation: true

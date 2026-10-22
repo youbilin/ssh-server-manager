@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" fill="none">
+  <rect width="1200" height="280" rx="14" fill="#0D1117"/>
+  <rect x="1" y="1" width="1198" height="278" rx="13" stroke="#30363D"/>
+  <circle cx="42" cy="38" r="5" fill="#F85149"/>
+  <circle cx="60" cy="38" r="5" fill="#D29922"/>
+  <circle cx="78" cy="38" r="5" fill="#3FB950"/>
+  <text x="42" y="82" fill="#8B949E" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="3">CLAUDE CODE / CODEX SKILL</text>
+  <text x="40" y="148" fill="#E6EDF3" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="56" font-weight="700">ssh-server-manager</text>
+  <rect x="42" y="168" width="180" height="4" rx="2" fill="#3FB950"/>
+  <text x="42" y="207" fill="#8B949E" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="21">Safety-first SSH operations for Linux servers.</text>
+  <text x="42" y="243" fill="#7EE787" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">read-only recon  ->  risk tier  ->  verified key  ->  act  ->  audit</text>
+  <rect x="760" y="62" width="398" height="156" rx="10" fill="#161B22" stroke="#30363D"/>
+  <text x="784" y="94" fill="#8B949E" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">$ ssh_exec.sh -H web1 --preflight</text>
+  <text x="784" y="120" fill="#3FB950" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">OK  connection verified</text>
+  <text x="784" y="152" fill="#8B949E" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">$ profile_store.sh show -H web1</text>
+  <text x="784" y="178" fill="#C9D1D9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">Ubuntu 24.04  |  8 cores  |  16 GB</text>
+  <text x="784" y="200" fill="#C9D1D9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">nginx  php-fpm  docker</text>
+</svg>
