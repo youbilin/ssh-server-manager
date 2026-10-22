@@ -10,6 +10,8 @@
 #   ./ssh_exec.sh -H 10.0.0.5 -u deploy -p 2222 -J bastion -t 60 -c 'uptime'
 #   ./ssh_exec.sh -H web1 --preflight
 #   ./ssh_exec.sh -H web1 -f ./health_check.sh -t 180      # 本地脚本经 stdin 交给远端 bash
+#   ./ssh_exec.sh -H web1 --upload ./app.tgz /tmp/app.tgz  # 上传，走同一套认证/审计
+#   ./ssh_exec.sh -H web1 --download /var/log/app.log ./app.log
 #   ./ssh_exec.sh -H web1 --dry-run -c 'rm -rf /tmp/x'     # 只看风险判定，不执行
 #   ./ssh_exec.sh -H web1 --show-host-key                  # 只打印指纹，不写入
 #   ./ssh_exec.sh -H web1 --accept-host-key --fingerprint SHA256:xxxx
@@ -65,6 +67,13 @@ QUIET=0
 LOG_LABEL=""
 NO_PREFLIGHT=0
 SELFTEST=0
+# 文件传输：复用同一套认证/主机密钥/审计，避免 scp/rsync 绕过 wrapper
+TRANSFER_MODE=""          # upload | download
+UPLOAD_LOCAL=""
+UPLOAD_REMOTE=""
+DOWNLOAD_REMOTE=""
+DOWNLOAD_LOCAL=""
+RECURSIVE=0
 # 密码认证
 AUTH_MODE="auto"          # auto | key | password
 PASSWORD_ENV=""           # --password-env VAR
@@ -104,6 +113,7 @@ hint() { [ "$QUIET" -eq 1 ] || printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
 # 所有要清理的东西都登记在 TMP_FILES 里；否则后注册的 trap 会把前一个顶掉，
 # 密码临时文件就会留在磁盘上。
 OUT_FILE=""
+ERR_FILE=""
 WATCHDOG_PID=""
 cleanup() {
   local f
@@ -114,6 +124,7 @@ cleanup() {
     done
   fi
   [ -n "${OUT_FILE:-}" ] && rm -f "$OUT_FILE" 2>/dev/null
+  [ -n "${ERR_FILE:-}" ] && rm -f "$ERR_FILE" 2>/dev/null
   [ -n "${ASKPASS_HELPER:-}" ] && rm -f "$ASKPASS_HELPER" 2>/dev/null
   [ -n "${PW_TMPFILE:-}" ] && rm -f "$PW_TMPFILE" 2>/dev/null
   PASSWORD=""
@@ -124,7 +135,7 @@ trap cleanup EXIT
 trap on_signal INT TERM HUP
 
 usage() {
-  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'USAGE'
 
 选项:
@@ -144,6 +155,11 @@ usage() {
       --confirm-danger   声明已就高危命令向用户二次确认（否则拒绝执行）
       --dry-run          只打印将执行的命令与风险等级，不执行；不连接、不读口令
       --print-tier       只输出风险等级数字（0/1/2），不连接、不需要 -H
+      --upload LOCAL REMOTE
+                         上传文件：LOCAL -> 远端 REMOTE（走同一套认证、审计与分级）
+      --download REMOTE LOCAL
+                         下载文件：远端 REMOTE -> 本地 LOCAL
+      --recursive        配合 --upload/--download 传输目录（scp -r）
       --accept-host-key  首次连接时把远端指纹写入 known_hosts（须先人工核对指纹）
                          单独使用即可，不必同时给 -c；写入前必须提供 --fingerprint
       --show-host-key    只扫描并打印候选指纹，不写入 known_hosts
@@ -177,6 +193,7 @@ usage() {
                           只有在你自己的会话里 export 过才更安全）
   SSHMGR_CREDENTIAL_FILE  默认凭据文件路径
   SSHMGR_SSH              指定 ssh 可执行文件（默认从 PATH 解析）
+  SSHMGR_SCP              指定 scp 可执行文件（--upload/--download 用）
   SSHMGR_ASKPASS_DEBUG=1  把 askpass 收到的 prompt 记到 askpass.log（绝不记口令），
                           用于排查"口令为什么没发出去"
   SSHMGR_NO_MUX=1         关闭连接复用（默认开 ControlMaster，10 分钟内只认证一次）
@@ -208,6 +225,13 @@ while [ $# -gt 0 ]; do
     --fingerprint)     need_arg "$1" $#; FINGERPRINT="$2"; shift 2 ;;
     --dry-run)         DRY_RUN=1; shift ;;
     --print-tier)      PRINT_TIER=1; shift ;;
+    --upload)
+      [ $# -ge 3 ] || { err "--upload 需要 LOCAL 和 REMOTE 两个参数"; exit 1; }
+      TRANSFER_MODE="upload"; UPLOAD_LOCAL="$2"; UPLOAD_REMOTE="$3"; shift 3 ;;
+    --download)
+      [ $# -ge 3 ] || { err "--download 需要 REMOTE 和 LOCAL 两个参数"; exit 1; }
+      TRANSFER_MODE="download"; DOWNLOAD_REMOTE="$2"; DOWNLOAD_LOCAL="$3"; shift 3 ;;
+    --recursive)       RECURSIVE=1; shift ;;
     --no-log)          DO_LOG=0; shift ;;
     --label)           need_arg "$1" $#; LOG_LABEL="$2"; shift 2 ;;
     --selftest)        SELFTEST=1; shift ;;
@@ -263,11 +287,17 @@ fi
 if [ "$NO_PREFLIGHT" -eq 1 ] && [ "$PREFLIGHT" -eq 1 ]; then
   err "--preflight 与 --no-preflight 不能同时使用"; exit 1
 fi
+if [ -n "$TRANSFER_MODE" ] && { [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ]; }; then
+  err "--upload/--download 不能与 -c/-f 同时使用"; exit 1
+fi
+if [ "$RECURSIVE" -eq 1 ] && [ -z "$TRANSFER_MODE" ]; then
+  err "--recursive 只能配合 --upload/--download 使用"; exit 1
+fi
 if [ "$ACCEPT_HOST_KEY" -eq 1 ] && [ "$SHOW_HOST_KEY" -eq 1 ]; then
   err "--accept-host-key 与 --show-host-key 不能同时使用"; exit 1
 fi
-if [ "$SHOW_HOST_KEY" -eq 1 ] && { [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ] || [ "$PREFLIGHT" -eq 1 ]; }; then
-  err "--show-host-key 只扫描并打印指纹，不能与 -c/-f/--preflight 同时使用"; exit 1
+if [ "$SHOW_HOST_KEY" -eq 1 ] && { [ -n "$COMMAND" ] || [ -n "$SCRIPT_FILE" ] || [ "$PREFLIGHT" -eq 1 ] || [ -n "$TRANSFER_MODE" ]; }; then
+  err "--show-host-key 只扫描并打印指纹，不能与命令/传输/--preflight 同时使用"; exit 1
 fi
 if [ -n "$FINGERPRINT" ] && [ "$ACCEPT_HOST_KEY" -eq 0 ] && [ "$SHOW_HOST_KEY" -eq 0 ]; then
   err "--fingerprint 只能配合 --accept-host-key 或 --show-host-key 使用"; exit 1
@@ -299,8 +329,24 @@ fi
     err "必须指定目标主机（-H）"; exit 1
   fi
 }
-if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ] && [ "$SELFTEST" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$ACCEPT_HOST_KEY" -eq 0 ] && [ "$SHOW_HOST_KEY" -eq 0 ]; then
-  err "需要 -c '命令'、-f 脚本文件、--preflight、--accept-host-key 或 --selftest 之一"; exit 1
+if [ -z "$COMMAND" ] && [ -z "$SCRIPT_FILE" ] && [ "$PREFLIGHT" -eq 0 ] && [ "$SELFTEST" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$ACCEPT_HOST_KEY" -eq 0 ] && [ "$SHOW_HOST_KEY" -eq 0 ] && [ -z "$TRANSFER_MODE" ]; then
+  err "需要 -c '命令'、-f 脚本文件、--upload/--download、--preflight、--accept-host-key 或 --selftest 之一"; exit 1
+fi
+
+if [ -n "$TRANSFER_MODE" ]; then
+  SCP_BIN="${SSHMGR_SCP:-scp}"
+  command -v "$SCP_BIN" >/dev/null 2>&1 || [ -x "$SCP_BIN" ] || { err "找不到 scp 可执行文件: $SCP_BIN（可用 SSHMGR_SCP 指定）"; exit 1; }
+  if [ "$TRANSFER_MODE" = "upload" ]; then
+    [ -e "$UPLOAD_LOCAL" ] || { err "本地路径不存在: $UPLOAD_LOCAL"; exit 1; }
+    [ -n "$HOST" ] || { err "--upload 需要目标主机（-H）"; exit 1; }
+    [ -n "$UPLOAD_REMOTE" ] || { err "远端路径不能为空"; exit 1; }
+    case "$UPLOAD_REMOTE" in *$'\n'*|*$'\r'*) err "远端路径包含换行"; exit 1 ;; esac
+  else
+    [ -n "$HOST" ] || { err "--download 需要目标主机（-H）"; exit 1; }
+    [ -n "$DOWNLOAD_REMOTE" ] || { err "远端路径不能为空"; exit 1; }
+    case "$DOWNLOAD_REMOTE" in *$'\n'*|*$'\r'*) err "远端路径包含换行"; exit 1 ;; esac
+    [ -d "$(dirname "$DOWNLOAD_LOCAL")" ] || { err "本地目标目录不存在: $(dirname "$DOWNLOAD_LOCAL")"; exit 1; }
+  fi
 fi
 
 if [ -n "$SCRIPT_FILE" ]; then
@@ -318,6 +364,12 @@ TARGET_LABEL="$HOST"
 if [ -n "$USER_NAME" ]; then
   TARGET="${USER_NAME}@${HOST}"
   TARGET_LABEL="$TARGET"
+fi
+
+if [ "$TRANSFER_MODE" = "upload" ]; then
+  COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${UPLOAD_LOCAL} ${TARGET}:${UPLOAD_REMOTE}"
+elif [ "$TRANSFER_MODE" = "download" ]; then
+  COMMAND="scp $([ "$RECURSIVE" -eq 1 ] && echo '-r ')${TARGET}:${DOWNLOAD_REMOTE} ${DOWNLOAD_LOCAL}"
 fi
 
 # ---------- 风险分级 ----------
@@ -906,12 +958,38 @@ fi
 # 连接复用：默认每次调用要预检 + 执行 = 两次 TCP 握手、两次认证。
 # 对密钥是延迟问题；对密码则是口令要重复提交两遍、Failed password 机会翻倍。
 # ControlPersist 10m 让这段时间内只认证一次。msys 的 ssh 不会自己建 ControlPath 目录。
+SSH_OPTS_CORE=("${SSH_OPTS[@]}")
+MUX_ENABLED=0
 if [ "${SSHMGR_NO_MUX:-0}" != "1" ]; then
   CM_DIR="$LOG_DIR/cm"
   if mkdir -p "$CM_DIR" 2>/dev/null; then
     chmod 700 "$CM_DIR" 2>/dev/null || true
     SSH_OPTS+=( -o ControlMaster=auto -o "ControlPath=$CM_DIR/%C" -o ControlPersist=10m )
+    MUX_ENABLED=1
   fi
+fi
+
+# 文件传输单独走 scp，直接连接（不依赖容易失效的 control socket），
+# 但认证方式、严格主机密钥和 askpass 与 ssh 路径完全一致。
+SCP_OPTS=()
+if [ -n "$TRANSFER_MODE" ]; then
+  SCP_OPTS=(
+    -S "$SSH_BIN"
+    -o "ConnectTimeout=${CONNECT_TIMEOUT}"
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
+    -o "StrictHostKeyChecking=yes"
+    -o ControlMaster=no
+  )
+  if [ "$AUTH_RESOLVED" = "password" ]; then
+    SCP_OPTS+=( -o "BatchMode=no" -o "NumberOfPasswordPrompts=1" )
+    SCP_OPTS+=( -o "PubkeyAuthentication=no" -o "PreferredAuthentications=password,keyboard-interactive" )
+  else
+    SCP_OPTS+=( -o BatchMode=yes -o "NumberOfPasswordPrompts=0" )
+  fi
+  [ -n "$PORT" ] && SCP_OPTS+=( -P "$PORT" )
+  [ -n "$JUMP" ] && SCP_OPTS+=( -o "ProxyJump=$JUMP" )
+  [ -n "$IDENTITY" ] && SCP_OPTS+=( -i "$IDENTITY" -o IdentitiesOnly=yes )
 fi
 
 # ---------- 错误诊断 ----------
@@ -1005,6 +1083,16 @@ if [ "$NO_PREFLIGHT" -eq 0 ]; then
   [ -n "$SCRIPT_FILE" ] && preflight_remote="sh -c 'command -v bash >/dev/null 2>&1 || { echo SSHMGR_PREFLIGHT_NO_BASH; exit 127; }'"
   preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$preflight_remote" 2>&1)"
   preflight_rc=$?
+  # 某些 Windows/Git-Bash + 透明代理/网络设备组合下 ControlMaster 会被重置。
+  # 认证本身可能是成功的；自动退回单连接再试一次，而不是把用户推向排查网络。
+  if [ "$preflight_rc" -ne 0 ] && [ "$MUX_ENABLED" -eq 1 ] && \
+     printf '%s' "$preflight_out" | grep -Eqi 'mux_client|failed to connect to new control master|control master|multiplex'; then
+    warn "连接复用（ControlMaster）失败，自动改用单连接重试（本次不复用连接）。"
+    SSH_OPTS=("${SSH_OPTS_CORE[@]}")
+    MUX_ENABLED=0
+    preflight_out="$(run_limited "$CONNECT_TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$preflight_remote" 2>&1)"
+    preflight_rc=$?
+  fi
 fi
 
 if [ "$preflight_rc" -ne 0 ] && printf '%s' "$preflight_out" | grep -q 'SSHMGR_PREFLIGHT_NO_BASH'; then
@@ -1051,24 +1139,38 @@ fi
 # ---------- 执行 ----------
 say "${C_DIM}-> 执行中 (timeout ${TIMEOUT}s)...${C_OFF}"
 OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/sshmgr.XXXXXX")" || { err "无法创建临时文件"; exit 1; }
-TMP_FILES+=("$OUT_FILE")
+ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/sshmgr-err.XXXXXX")" || { err "无法创建临时文件"; exit 1; }
+TMP_FILES+=("$OUT_FILE" "$ERR_FILE")
 
-if [ -n "$SCRIPT_FILE" ]; then
-  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_SCRIPT_CMD" < "$SCRIPT_FILE" > "$OUT_FILE" 2>&1
+# stdout 是调用方消费的载荷（profile/health 的 key=value、batch 的日志）；
+# ssh 自己的警告（mux、IdentityFile）走 stderr，不能混进载荷。
+if [ "$TRANSFER_MODE" = "upload" ]; then
+  _scp_args=("${SCP_OPTS[@]}")
+  [ "$RECURSIVE" -eq 1 ] && _scp_args+=(-r)
+  run_limited "$TIMEOUT" "$SCP_BIN" "${_scp_args[@]}" -- "$UPLOAD_LOCAL" "${TARGET}:${UPLOAD_REMOTE}" > "$OUT_FILE" 2> "$ERR_FILE"
+elif [ "$TRANSFER_MODE" = "download" ]; then
+  _scp_args=("${SCP_OPTS[@]}")
+  [ "$RECURSIVE" -eq 1 ] && _scp_args+=(-r)
+  run_limited "$TIMEOUT" "$SCP_BIN" "${_scp_args[@]}" -- "${TARGET}:${DOWNLOAD_REMOTE}" "$DOWNLOAD_LOCAL" > "$OUT_FILE" 2> "$ERR_FILE"
+elif [ -n "$SCRIPT_FILE" ]; then
+  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$REMOTE_SCRIPT_CMD" < "$SCRIPT_FILE" > "$OUT_FILE" 2> "$ERR_FILE"
 else
-  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$COMMAND" > "$OUT_FILE" 2>&1
+  run_limited "$TIMEOUT" "$SSH_BIN" "${SSH_OPTS[@]}" "$TARGET" "$COMMAND" > "$OUT_FILE" 2> "$ERR_FILE"
 fi
 rc=$?
 dur=$(( $(date +%s) - start_ts ))
 
 cat "$OUT_FILE"
+if [ -s "$ERR_FILE" ]; then
+  cat "$ERR_FILE" >&2
+fi
 
 if [ "$rc" -eq 124 ]; then
   err "执行超时（${TIMEOUT}s）—— 远端命令可能仍在运行，先确认其状态再决定是否重试"
   say "  提示：长任务用 nohup / setsid 放后台，或用 -t 调大超时"
 elif [ "$rc" -ne 0 ]; then
   err "远端命令退出码 ${rc}（耗时 ${dur}s）"
-  diagnose "$(cat "$OUT_FILE")"
+  diagnose "$(cat "$OUT_FILE" 2>/dev/null; cat "$ERR_FILE" 2>/dev/null)"
 else
   say "${C_GRN}OK${C_OFF} (rc=0, ${dur}s)"
 fi

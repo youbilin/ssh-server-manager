@@ -16,6 +16,16 @@ if [ "${FAKE_SSH_NO_BASH:-0}" = "1" ]; then
   esac
 fi
 
+if [ "${FAKE_SSH_MUX_FAIL:-0}" = "1" ]; then
+  case " $* " in
+    *"ControlMaster=auto"*)
+      case " $* " in
+        *" true "*) echo "mux_client_request_session: read from master failed: Connection reset by peer"; echo "Failed to connect to new control master"; exit 255 ;;
+      esac
+      ;;
+  esac
+fi
+
 for a in "$@"; do
   if [ "$a" = "-G" ]; then
     printf 'hostname %s\n' "${FAKE_SSH_G_HOST:-fake-host}"

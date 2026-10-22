@@ -154,9 +154,10 @@ Record every remote command you run to a local log, in the format
 `~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`. Fields are escaped (`|` →
 `\|`, backslash → `\\`) so the line remains parseable.
 
-`scripts/ssh_exec.sh` writes this automatically; add entries by hand when you execute some
-other way. The log is append-only, not tamper-evident: anyone who can write the file can
-edit it, so ship it off-box if it is part of a compliance requirement. Set
+`scripts/ssh_exec.sh` writes this automatically, including `--upload/--download` transfers.
+Add entries by hand when you execute some other way (notably direct `scp`/`rsync`). The log is
+append-only, not tamper-evident: anyone who can write the file can edit it, so ship it off-box
+if it is part of a compliance requirement. Set
 `SSHMGR_AUDIT_MAX_BYTES` to rotate to `audit.log.1` when the file grows past that size.
 Why it's worth keeping: the first question in any incident review is "who changed what,
 when" — and often this file is all that's left.
@@ -350,8 +351,9 @@ for host-key checks and profile naming, so aliases and non-22 ports are handled 
 - **Connection multiplexing is on by default** (`ControlMaster` + `ControlPath=$LOG_DIR/cm/%C`
   + `ControlPersist=10m`). This matters especially for password login: without multiplexing,
   every invocation does preflight + execute = **two authentications**, meaning the password is
-  submitted twice and the opportunity for a `Failed password` entry doubles. Set
-  `SSHMGR_NO_MUX=1` to turn it off.
+  submitted twice and the opportunity for a `Failed password` entry doubles. If the preflight
+  reports a mux failure, the wrapper retries once without multiplexing automatically. In
+  unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
 - Through a jump host (`-J`), a local tcping does not measure latency to the target; the script
   records it as `skip=jump`.
 - For connection-failure diagnosis order and commands see section 1 of
@@ -463,6 +465,12 @@ awk '$9==502 {print $7}' /var/log/nginx/access.log | sort | uniq -c | sort -rn |
 ## 5. File Operations
 
 ```bash
+# Through the wrapper: same password/known_hosts/audit/tiering as every other operation
+scripts/ssh_exec.sh -H web1 --upload ./app.tar.gz /tmp/app.tar.gz
+scripts/ssh_exec.sh -H web1 --download /var/log/app.log ./app.log
+scripts/ssh_exec.sh -H web1 --recursive --upload ./dist /srv/app/dist
+
+# Direct bulk transfer (use a key for non-interactive rsync)
 scp -P 2222 ./app.tar.gz deploy@web1:/tmp/
 rsync -avz --progress --partial -e 'ssh -p 2222' ./dist/ deploy@web1:/srv/app/dist/
 rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run before deleting remotely
@@ -471,6 +479,10 @@ rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run bef
 scp -P 2222 deploy@web1:/var/log/app.log ./
 rsync -avz --partial -e 'ssh -p 2222' deploy@web1:/srv/app/logs/ ./logs/
 ```
+
+⚠ Direct `scp`/`rsync` bypass this skill's audit log, risk tiering and askpass password flow.
+Use `ssh_exec.sh --upload/--download` for one-off or password-authenticated transfers; use
+`rsync` directly only for bulk work where you can accept that trade-off.
 
 - Use `rsync` rather than `scp` for many small files; add `--partial` for resumability.
   `--delete` is a mutating operation — dry-run it first to see the list.
@@ -575,7 +587,7 @@ scripts/batch_run.sh --hosts-file hosts.txt --cmd 'apt-get -y upgrade' --confirm
 
 | Script | Purpose | Typical call |
 |---|---|---|
-| `scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log | `ssh_exec.sh -H web1 -c 'df -h'` |
+| `scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log, audited upload/download | `ssh_exec.sh -H web1 -c 'df -h'` |
 | `scripts/health_check.sh` | One-shot inspection that runs on the remote host, structured output | `ssh_exec.sh -H web1 -f scripts/health_check.sh -t 180` |
 | `scripts/batch_run.sh` | Run across many hosts and summarize (tag filtering, concurrency, failure summary) | `batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime'` |
 | `scripts/backup_config.sh` | Back up before a config change; prints a restore command with the ssh prefix already attached | `backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |

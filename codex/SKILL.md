@@ -140,9 +140,9 @@ Record every remote command you run to a local log, in the format
 `~/.ssh-server-manager/audit.log`, overridable with `SSHMGR_LOG`. Fields are escaped so the line
 stays parseable.
 
-`scripts/ssh_exec.sh` writes this automatically; add entries by hand when you execute some
-other way. The log is append-only, not tamper-evident; ship it off-box if compliance requires
-that. Set `SSHMGR_AUDIT_MAX_BYTES` to rotate to `audit.log.1`. Why it's worth keeping: the first
+`scripts/ssh_exec.sh` writes this automatically, including `--upload/--download` transfers.
+Add entries by hand when you execute some other way (notably direct `scp`/`rsync`). The log is
+append-only, not tamper-evident; ship it off-box if compliance requires that. Set `SSHMGR_AUDIT_MAX_BYTES` to rotate to `audit.log.1`. Why it's worth keeping: the first
 question in any incident review is "who changed what, when" — and often this file is all that's
 left.
 
@@ -324,8 +324,9 @@ mechanism rather than a good intention.
 - **Connection multiplexing is on by default** (`ControlMaster` + `ControlPath=$LOG_DIR/cm/%C`
   + `ControlPersist=10m`). This matters especially for password login: without multiplexing,
   every invocation does preflight + execute = **two authentications**, meaning the password is
-  submitted twice and the opportunity for a `Failed password` entry doubles. Set
-  `SSHMGR_NO_MUX=1` to turn it off.
+  submitted twice and the opportunity for a `Failed password` entry doubles. If the preflight
+  reports a mux failure, the wrapper retries once without multiplexing automatically. In
+  unstable proxy/Windows setups set `SSHMGR_NO_MUX=1`.
 - Through a jump host (`-J`), a local tcping does not measure latency to the target; the script
   records it as `skip=jump`.
 - For connection-failure diagnosis order and commands see section 1 of
@@ -436,6 +437,12 @@ awk '$9==502 {print $7}' /var/log/nginx/access.log | sort | uniq -c | sort -rn |
 ## 5. File Operations
 
 ```bash
+# Through the wrapper: same password/known_hosts/audit/tiering as every other operation
+bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 --upload ./app.tar.gz /tmp/app.tar.gz
+bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 --download /var/log/app.log ./app.log
+bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 --recursive --upload ./dist /srv/app/dist
+
+# Direct bulk transfer (use a key for non-interactive rsync)
 scp -P 2222 ./app.tar.gz deploy@web1:/tmp/
 rsync -avz --progress --partial -e 'ssh -p 2222' ./dist/ deploy@web1:/srv/app/dist/
 rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run before deleting remotely
@@ -444,6 +451,10 @@ rsync -avz --dry-run --delete ./dist/ deploy@web1:/srv/app/dist/   # dry-run bef
 scp -P 2222 deploy@web1:/var/log/app.log ./
 rsync -avz --partial -e 'ssh -p 2222' deploy@web1:/srv/app/logs/ ./logs/
 ```
+
+⚠ Direct `scp`/`rsync` bypass this skill's audit log, risk tiering and askpass password flow.
+Use `ssh_exec.sh --upload/--download` for one-off or password-authenticated transfers; use
+`rsync` directly only for bulk work where you can accept that trade-off.
 
 - Use `rsync` rather than `scp` for many small files; add `--partial` for resumability.
   `--delete` is a mutating operation — dry-run it first to see the list.
@@ -687,7 +698,7 @@ Reference documents live under `$SKILL_DIR/references/`; read them on demand, no
 
 | Script | Purpose | Typical call |
 |---|---|---|
-| `$SKILL_DIR/scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -c 'df -h'` |
+| `$SKILL_DIR/scripts/ssh_exec.sh` | Remote execution wrapper: preflight, timeout, risk tiering, audit log, audited upload/download | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -c 'df -h'` |
 | `$SKILL_DIR/scripts/health_check.sh` | One-shot inspection that runs on the remote host, structured output | `bash $SKILL_DIR/scripts/ssh_exec.sh -H web1 -f $SKILL_DIR/scripts/health_check.sh -t 180` |
 | `$SKILL_DIR/scripts/batch_run.sh` | Run across many hosts and summarize (tag filtering, concurrency, failure summary) | `bash $SKILL_DIR/scripts/batch_run.sh --inventory inv.yaml --tags web --cmd 'uptime'` |
 | `$SKILL_DIR/scripts/backup_config.sh` | Back up before a config change; prints a restore command with the ssh prefix attached | `bash $SKILL_DIR/scripts/backup_config.sh -H web1 -f /etc/nginx/nginx.conf` |

@@ -54,9 +54,10 @@ mechanism, because a one-off login should not require generating a key pair firs
 | 📝 | Audit log | `timestamp \| host \| tier \| exit code \| duration \| command`, escaped and appended by the wrapper itself |
 | 🗂 | Server profiles | One-time collection of slow-moving facts; fingerprint-first identity; per-port files; local `compare` |
 | 🩺 | One-shot inspection | Structured report ending in `SSHMGR_VERDICT=OK\|WARN\|CRIT`; thresholds pass via `-A "--disk-warn 75"`; systemd and OpenRC service checks |
-| 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; `--selftest` validates the local environment |
+| 🔌 | Failure diagnosis | Translates `ssh` errors into the next diagnostic step; auto-retries without a broken ControlMaster; `--selftest` validates the local environment |
 | 🚫 | Benchmark refusal | `sysbench`/`fio`/`stress-ng`/`iperf3` are tier 2 by default — load tests on production corrupt metrics and can OOM a host |
 | 🧯 | Config-change protocol | Backup → syntax check → rollback timer → verify in a second session; the printed restore line already carries the ssh prefix |
+| 📤 | Audited transfers | `--upload`/`--download` reuse password askpass, strict host keys, tiering and audit; direct `scp`/`rsync` bypass them |
 | 🖥 | Batch execution | Tag-based selection, bounded concurrency, per-host logs, explicit failure list, per-host auth |
 | 🌐 | Zero remote load for latency | TCP handshake probing runs locally and detects transparent proxies that would falsify the numbers |
 | ✅ | Offline regression suite | `tests/run.sh` uses a fake ssh/keyscan/docker and needs no network; CI runs on Linux, macOS and Git-Bash |
@@ -187,6 +188,9 @@ Preflight, timeout, risk classification, audit logging, and error diagnosis in o
 ssh_exec.sh -H web1 -c 'df -h'                          # read-only
 ssh_exec.sh -H web1 --preflight                         # connectivity only
 ssh_exec.sh -H web1 -f scripts/health_check.sh -t 180   # run a local script remotely
+ssh_exec.sh -H web1 --upload ./app.tgz /tmp/app.tgz     # audited upload
+ssh_exec.sh -H web1 --download /var/log/app.log ./      # audited download
+ssh_exec.sh -H web1 --recursive --upload ./dist /srv/app/dist
 ssh_exec.sh -H web1 --dry-run -c 'rm -rf /tmp/x'        # show the tier; no connection, no credentials
 ssh_exec.sh --print-tier -c 'systemctl restart nginx'   # machine-readable tier: 0/1/2
 ssh_exec.sh -H web1 --show-host-key                     # print fingerprints, write nothing
@@ -194,7 +198,13 @@ ssh_exec.sh -H web1 --show-host-key                     # print fingerprints, wr
 
 Key options: `-u/--user`, `-p/--port`, `-J/--jump`, `-i/--identity`, `-t/--timeout`,
 `--preflight`, `--confirm-danger`, `--accept-host-key --fingerprint SHA256:…`,
-`--show-host-key`, `--dry-run`, `--print-tier`, `--no-log`, `-q/--quiet`.
+`--show-host-key`, `--upload`, `--download`, `--recursive`, `--dry-run`, `--print-tier`,
+`--no-log`, `-q/--quiet`.
+
+Upload/download run `scp` with the same password askpass, strict host-key checking and audit
+logging as the command path; they are tier 1 and respect `--confirm-danger` for writes to
+critical remote paths. Direct `scp`/`rsync` remain available for bulk work but bypass the audit
+log and askpass flow.
 
 `--accept-host-key` requires the complete `--fingerprint` value, matches it exactly, and writes
 only that one key line. It works without `-c` and exits after writing. `--dry-run`,
@@ -349,7 +359,8 @@ after you have confirmed the change. Non-22 ports get their own `<target>_<port>
 - **Profile files are never `source`d or `eval`ed.** Values originate from the remote host, so a
   malicious container name would otherwise be local code execution.
 - **The audit log is append-only, not immutable.** Anyone who can write the file can edit it;
-  ship it off-box if compliance requires tamper evidence.
+  ship it off-box if compliance requires tamper evidence. `ssh_exec.sh --upload/--download`
+  is audited; direct `scp`/`rsync` is not.
 
 ## Documentation
 
@@ -401,8 +412,9 @@ bash tests/run.sh
 The suite needs no network and no real host: fake `ssh`, `ssh-keyscan` and `docker` are used,
 with host keys generated locally. It covers risk classification, dry-run/selftest side effects,
 credential temp files, exact host-key matching, profile port/lookup/stale/identity behavior,
-restore-command generation, Docker health classification, batch confirmation/stop behavior, and
-systemd/OpenRC service detection. CI runs the same suite on Ubuntu, macOS and Windows (Git-Bash),
+restore-command generation, Docker health classification, batch confirmation/stop behavior,
+audited transfer modes, and systemd/OpenRC service detection. CI runs the same suite on Ubuntu,
+macOS and Windows (Git-Bash),
 plus `shellcheck`, a BSD/onetrue-awk profile pass, and a Codex-copy sync check. Alpine/OpenRC
 targets need `bash` installed (`apk add bash`).
 

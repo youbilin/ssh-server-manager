@@ -55,6 +55,13 @@ run_ps collect -H web1.example -p 2222 --sections docker --skip-tcping >/dev/nul
 grep -q '^stale_sections=services$' "$SSHMGR_HOME/profiles/web1.example_2222.profile"
 assert_rc 0 $? "services should remain stale after refreshing only docker"
 
+# 2b. A refresh without a latency probe keeps the previous latency values.
+CURRENT_TEST="latency preservation"
+printf 'latency_min_ms=10\nlatency_avg_ms=12\nlatency_reliable=1\n' >> "$SSHMGR_HOME/profiles/web1.example_2222.profile"
+run_ps collect -H web1.example -p 2222 --sections docker --skip-tcping >/dev/null
+grep -q '^latency_avg_ms=12$' "$SSHMGR_HOME/profiles/web1.example_2222.profile"
+assert_rc 0 $? "latency should survive a skip-tcping refresh"
+
 # 3. Collecting by alias without -p reuses the stored port/profile.
 CURRENT_TEST="alias reuse"
 setup_fake_ssh fake-host 2222 deploy
@@ -74,6 +81,8 @@ log="$(cat "$SANDBOX/ssh.log")"
 assert_contains "-p 2222" "$log" "stored port should be reused"
 assert_contains "-J bastion" "$log" "stored jump should be reused"
 assert_contains "deploy@jumphost.example" "$log" "stored user should be reused"
+grep -q '^latency_reliable=skip$' "$SSHMGR_HOME/profiles/jumphost.example_2222.profile"
+assert_rc 0 $? "jump latency should be marked skip"
 printf 'boot-1\n123\n' > "$SANDBOX/check.out"
 export FAKE_SSH_OUTPUT="$SANDBOX/check.out"
 out="$(run_ps check -H jumphost.example)"

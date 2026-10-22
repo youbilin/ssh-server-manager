@@ -72,6 +72,12 @@ ssh-keygen -R host                    # remove the old entry (only after confirm
 **Transferring Files**
 
 ```bash
+# Through the skill wrapper: same auth, known_hosts, audit and tiering
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 --upload ./app.tar.gz /tmp/app.tar.gz
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 --download /var/log/app.log ./app.log
+bash "$SKILL_DIR/scripts/ssh_exec.sh" -H web1 --recursive --upload ./dist /srv/app/dist
+
+# Direct bulk transfer (not audited by the wrapper)
 scp -P 2222 ./app.tar.gz deploy@host:/tmp/
 scp -r -P 2222 deploy@host:/var/log/nginx/ ./nginx-logs/
 rsync -avz --partial --progress -e 'ssh -p 2222' ./dist/ deploy@host:/srv/app/dist/

@@ -513,6 +513,19 @@ do_collect() {
   lat_skip="$(printf '%s' "$latency_line" | sed -n 's/.*[[:space:]]skip=\([a-z]*\).*/\1/p')"
   [ "${lat_rel:-1}" = "0" ] && warn "本机存在透明代理，延迟数值不可信（详见 tcping.sh 头部说明）"
 
+  # --skip-tcping 或本次探测失败时保留旧延迟；经跳板机的本地 RTT 无效，
+  # 必须写成 skip，不能拿旧值冒充。
+  if [ -z "$EFF_JUMP" ] && [ -z "$lat_avg" ] && [ -f "$pfile" ]; then
+    old_lat_min="$(pget "$pfile" latency_min_ms)"
+    old_lat_avg="$(pget "$pfile" latency_avg_ms)"
+    old_lat_rel="$(pget "$pfile" latency_reliable)"
+    if [ -n "$old_lat_avg" ]; then
+      lat_min="$old_lat_min"
+      lat_avg="$old_lat_avg"
+      lat_rel="$old_lat_rel"
+    fi
+  fi
+
   # ---------- 2. 远端采集 ----------
   dim "  -> 在 $TARGET 上采集（只读，不跑任何压测）..."
   build_run_args
@@ -615,7 +628,7 @@ do_collect() {
     if [ -n "${lat_skip:-}" ]; then
       printf 'latency_reliable=skip\n'
     else
-      printf 'latency_reliable=%s\n' "${lat_rel:-1}"
+      printf 'latency_reliable=%s\n' "${lat_rel:-unknown}"
     fi
     [ -n "$new_fp" ] && printf 'host_key_fp=%s\n' "$new_fp"
     printf 'alias=%s\n' "$write_alias"

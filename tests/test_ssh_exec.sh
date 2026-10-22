@@ -167,7 +167,14 @@ line="$(tail -1 "$SSHMGR_HOME/audit.log" 2>/dev/null)"
 assert_contains "tier0" "$line" "audit line tier"
 assert_contains 'echo a\|b' "$line" "audit line must escape pipes"
 
-# 10. Script mode preflights bash and gives an Alpine-specific message.
+# 10. A broken ControlMaster falls back to a direct connection instead of failing.
+CURRENT_TEST="mux fallback"
+out="$(FAKE_SSH_MUX_FAIL=1 bash "$SSH_EXEC" -H example.invalid --auth key -c 'true' 2>&1)"
+rc=$?
+assert_rc 0 "$rc" "mux fallback rc: $out"
+assert_contains "自动改用单连接" "$out" "mux fallback warning"
+
+# 11. Script mode preflights bash and gives an Alpine-specific message.
 CURRENT_TEST="missing remote bash"
 out="$(FAKE_SSH_NO_BASH=1 bash "$SSH_EXEC" -H example.invalid --auth key \
   -f "$ROOT_DIR/scripts/health_check.sh" 2>&1)"
@@ -176,7 +183,45 @@ assert_rc 2 "$rc" "missing bash rc"
 assert_contains "apk add bash" "$out" "Alpine guidance"
 assert_contains "没有 bash" "$out" "missing bash message"
 
-# 11. Usage guards.
+# 12. File transfer uses scp through the same wrapper (audit/tier/askpass options).
+CURRENT_TEST="upload"
+LFILE="$SANDBOX/upload.txt"
+printf 'transfer-test\n' > "$LFILE"
+export FAKE_SCP_LOG="$SANDBOX/scp.log"
+: > "$FAKE_SCP_LOG"
+out="$(sv -H example.invalid --auth key --upload "$LFILE" /tmp/remote.txt)"
+rc=$?
+assert_rc 0 "$rc" "upload rc: $out"
+assert_contains "$LFILE" "$(cat "$FAKE_SCP_LOG")" "scp should receive the local file"
+assert_contains "example.invalid:/tmp/remote.txt" "$(cat "$FAKE_SCP_LOG")" "scp should receive the remote path"
+assert_contains "tier1" "$(tail -1 "$SSHMGR_HOME/audit.log")" "transfer should be audited as tier1"
+
+CURRENT_TEST="download"
+: > "$FAKE_SCP_LOG"
+DL="$SANDBOX/download.txt"
+out="$(sv -H example.invalid --auth key --download /tmp/remote.txt "$DL")"
+rc=$?
+assert_rc 0 "$rc" "download rc: $out"
+assert_contains "example.invalid:/tmp/remote.txt" "$(cat "$FAKE_SCP_LOG")" "scp should receive the remote source"
+
+CURRENT_TEST="recursive transfer"
+: > "$FAKE_SCP_LOG"
+mkdir -p "$SANDBOX/upload-dir"
+printf 'nested\n' > "$SANDBOX/upload-dir/file.txt"
+out="$(sv -H example.invalid --auth key --recursive --upload "$SANDBOX/upload-dir" /tmp/dir)"
+rc=$?
+assert_rc 0 "$rc" "recursive upload rc: $out"
+assert_contains "-r" "$(cat "$FAKE_SCP_LOG")" "recursive scp flag"
+
+CURRENT_TEST="transfer danger gate"
+: > "$FAKE_SCP_LOG"
+out="$(sv -H example.invalid --auth key --upload "$LFILE" /etc/sudoers)"
+rc=$?
+assert_rc 4 "$rc" "dangerous upload should be refused"
+assert_contains "已拒绝执行" "$out" "danger message"
+assert_eq "0" "$(wc -l < "$FAKE_SCP_LOG" | tr -d ' ')" "scp must not run without --confirm-danger"
+
+# 13. Usage guards.
 CURRENT_TEST="usage guards"
 out="$(sv --fingerprint 'SHA256:x' -H h -c true)"
 assert_contains "只能配合" "$out" "fingerprint without accept/show should be rejected"
