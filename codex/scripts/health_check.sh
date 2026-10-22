@@ -118,7 +118,16 @@ show_addrs() {
 
 # systemd 需要真正可通信；只有二进制不算（容器/Chroot 常见）。
 SERVICE_MANAGER=""
-if have systemctl && { ! have timeout || timeout 3 systemctl show --property=Version >/dev/null 2>&1; }; then
+SYSTEMD_OK=0
+if have systemctl; then
+  # 有 timeout 就带上限；没有也必须真正调用一次，不能仅因为二进制存在就认定 systemd。
+  if have timeout; then
+    timeout 3 systemctl show --property=Version >/dev/null 2>&1 && SYSTEMD_OK=1
+  else
+    systemctl show --property=Version >/dev/null 2>&1 && SYSTEMD_OK=1
+  fi
+fi
+if [ "$SYSTEMD_OK" -eq 1 ]; then
   SERVICE_MANAGER="systemd"
 elif have rc-status; then
   SERVICE_MANAGER="openrc"
