@@ -64,3 +64,25 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check generated Codex copy
         run: bash tools/build-codex.sh --check
+
+  release-package:
+    name: release package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+      - name: Build archives
+        run: bash tools/package-release.sh v0.0.0-ci
+      - name: Verify archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c SHA256SUMS)
+          for archive in dist/*.tar.gz; do
+            tar -tzf "$archive" | grep -qx 'ssh-server-manager/SKILL.md'
+          done
+          for archive in dist/*.zip; do
+            unzip -Z1 "$archive" | grep -qx 'ssh-server-manager/SKILL.md'
+          done

@@ -15,12 +15,14 @@
   <p>
     <a href="#quick-start">Quick start</a> ·
     <a href="#installation">Installation</a> ·
+    <a href="https://github.com/youbilin/ssh-server-manager/releases">Releases</a> ·
     <a href="#how-it-works">How it works</a> ·
     <a href="#safety-model">Safety model</a> ·
     <a href="#script-reference">Scripts</a> ·
     <a href="#compatibility">Compatibility</a> ·
     <a href="#faq">FAQ</a>
   </p>
+  <p><a href="README.zh-CN.md">简体中文</a> · English</p>
 </div>
 
 ---
@@ -176,7 +178,45 @@ byte-for-byte; only the `SKILL.md` and Codex UI metadata differ.
 | Claude Code | repository root | `~/.claude/skills/ssh-server-manager` |
 | Codex | [`codex/`](codex/) | `~/.agents/skills/ssh-server-manager` |
 
-### Claude Code
+### From a release (recommended)
+
+Open the [latest release](https://github.com/youbilin/ssh-server-manager/releases/latest) and
+download the asset for your harness:
+
+| Harness | Asset | Extract into |
+|---|---|---|
+| Claude Code | `ssh-server-manager-claude-<version>.zip` (or `.tar.gz`) | `~/.claude/skills/` |
+| Codex | `ssh-server-manager-codex-<version>.zip` (or `.tar.gz`) | `~/.agents/skills/` |
+
+The archives contain a top-level `ssh-server-manager/` folder, so extracting into the skills
+directory creates the correct layout. Verify `SHA256SUMS` if you want an integrity check.
+
+```bash
+VERSION=v1.0.0
+
+# Claude Code (macOS / Linux)
+mkdir -p ~/.claude/skills
+unzip "ssh-server-manager-claude-$VERSION.zip" -d ~/.claude/skills/
+# or: tar -xzf "ssh-server-manager-claude-$VERSION.tar.gz" -C ~/.claude/skills/
+
+# Codex
+mkdir -p ~/.agents/skills
+unzip "ssh-server-manager-codex-$VERSION.zip" -d ~/.agents/skills/
+```
+
+```bash
+# Verify the downloaded assets
+sha256sum -c SHA256SUMS          # Linux / Git-Bash
+shasum -a 256 -c SHA256SUMS      # macOS
+```
+
+On Windows Git-Bash, use `"$USERPROFILE/.claude/skills"` and `"$USERPROFILE/.agents/skills"`.
+
+After extracting, start Claude Code or Codex and ask in natural language, for example:
+“登录 203.0.113.10，用 root 密码，看看磁盘和 nginx 状态。” The skill description triggers the
+workflow; no slash command is required.
+
+### Claude Code (from source)
 
 ```bash
 # macOS / Linux
@@ -191,7 +231,7 @@ git clone https://github.com/youbilin/ssh-server-manager.git \
 A symlink works too if you keep the working copy elsewhere. `SKILL.md` must sit at the root of
 the installed folder.
 
-### Codex
+### Codex (from source)
 
 ```bash
 git clone https://github.com/youbilin/ssh-server-manager.git /tmp/ssm
@@ -522,6 +562,7 @@ cached profiles, structured health checks, audited transfers and batch failure r
 
 | Document | Contents |
 |---|---|
+| [`README.zh-CN.md`](README.zh-CN.md) | 简体中文说明与安装指南 |
 | [`SKILL.md`](SKILL.md) | The operating rules the agent loads |
 | [`references/troubleshooting.md`](references/troubleshooting.md) | Symptom-indexed handbook: connectivity, disk/inode exhaustion, services, 502/504, load, OOM, ports, certificates, containers |
 | [`references/common-commands.md`](references/common-commands.md) | Commands grouped by scenario, including OpenRC and apk equivalents |
@@ -531,10 +572,12 @@ cached profiles, structured health checks, audited transfers and batch failure r
 | [`tests/`](tests/) | Offline regression suite and fake SSH/Docker binaries |
 | [`evals/`](evals/) | Skill and trigger evaluation fixtures |
 | [`tools/build-codex.sh`](tools/build-codex.sh) | Regenerate and verify the Codex shared copy |
+| [`tools/package-release.sh`](tools/package-release.sh) | Build the Claude/Codex release archives and `SHA256SUMS` |
 
 ```
 .
 ├── SKILL.md               # skill definition and operating rules
+├── README.zh-CN.md        # Chinese documentation
 ├── scripts/               # wrapper, collectors, profiles, transfers, batch
 ├── references/            # load-on-demand operations handbooks
 ├── assets/                # banner and inventory template

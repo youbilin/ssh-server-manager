@@ -21,3 +21,6 @@ Thumbs.db
 # Local skill install used for Codex testing
 .agents/
 .tmp-home/
+
+# Release build output
+dist/
