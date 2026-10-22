@@ -207,7 +207,7 @@ bash $SKILL_DIR/scripts/profile_store.sh collect -H 203.0.113.10 -u root --promp
 bash $SKILL_DIR/scripts/profile_store.sh find -H web1          # resolvable by alias, IP, or hostname
 bash $SKILL_DIR/scripts/profile_store.sh show -H web1 --short  # the ≤20-line portrait (show this, not 200 raw lines)
 bash $SKILL_DIR/scripts/profile_store.sh list                   # every profile in one table, with latency
-bash $SKILL_DIR/scripts/profile_store.sh check -H web1          # one connection to test whether it rebooted
+bash $SKILL_DIR/scripts/profile_store.sh check -H web1          # reboot check + disk IO since last collect
 bash $SKILL_DIR/scripts/profile_store.sh compare -H web1,web2   # local hardware/service comparison
 ```
 

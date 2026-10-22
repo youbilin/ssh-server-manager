@@ -284,6 +284,7 @@ wrapper.
 profile_store.sh collect -H web1 --sections docker,services   # partial refresh
 profile_store.sh find | show | list | check | compare | set | mark-stale | forget
 profile_store.sh compare -H web1,web2
+profile_store.sh check -H web1        # reboot check + disk IO since last collection
 ```
 
 Profiles are flat `key=value` files under `~/.ssh-server-manager/profiles/`, named

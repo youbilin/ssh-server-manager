@@ -153,7 +153,8 @@ $SKILL_DIR/scripts/profile_store.sh check -H web1
 ```
 
 - **No reboot** → the profile baseline (including the cumulative `/proc/diskstats` counters) is
-  still valid; keep using it.
+  still valid; keep using it. `check` also reports read/written MB since the stored baseline.
+  Block devices and their partitions (and LVM/mapper layers) can double-count the same I/O.
 - **Rebooted** → `runtime`/`services`/`storage` are invalid (the diskstats counters reset), but
   `identity` and `hw` **remain perfectly good** — there is no reason to re-read the CPU model
   because of a reboot.

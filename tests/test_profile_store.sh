@@ -83,10 +83,13 @@ assert_contains "-J bastion" "$log" "stored jump should be reused"
 assert_contains "deploy@jumphost.example" "$log" "stored user should be reused"
 grep -q '^latency_reliable=skip$' "$SSHMGR_HOME/profiles/jumphost.example_2222.profile"
 assert_rc 0 $? "jump latency should be marked skip"
-printf 'boot-1\n123\n' > "$SANDBOX/check.out"
+printf 'diskstat.0=sda|read=1000|written=2000\n' >> "$SSHMGR_HOME/profiles/jumphost.example_2222.profile"
+printf 'boot-1\n123\n__SSHMGR_DISKSTATS__\n8 0 sda 10 0 3048 0 20 0 4048 0 0 0 0\n' > "$SANDBOX/check.out"
 export FAKE_SSH_OUTPUT="$SANDBOX/check.out"
 out="$(run_ps check -H jumphost.example)"
 assert_contains "未重启" "$out" "check should reuse stored connection metadata: $out"
+assert_contains "磁盘 IO" "$out" "check should report disk IO"
+assert_contains "1.0 MB" "$out" "check should compute sector delta"
 export FAKE_SSH_OUTPUT="$FIXTURE"
 
 # 4. An explicit different port creates a separate profile.
@@ -116,6 +119,9 @@ printf 'alias=web10\nhostname=web10.example\nip_primary=203.0.113.100\nssh_port=
 setup_fake_ssh fake-host 22 deploy
 run_ps find -H web1 >/dev/null
 assert_rc 2 $? "prefix web1 must not match web10"
+printf 'collector_sha256=deadbeef\n' >> "$SSHMGR_HOME/profiles/web10.profile"
+out="$(run_ps hint -H web10)"
+assert_contains "采集器已更新" "$out" "collector change should be hinted"
 
 # 7. compare renders local profiles without a network call.
 CURRENT_TEST="compare"

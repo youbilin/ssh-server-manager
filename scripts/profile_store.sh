@@ -90,7 +90,7 @@ usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; cat <<'USAGE'
   find      按目标/别名/主机名/IP 查档案（本地，不联网）。命中 exit 0，未命中 exit 2
   show      输出档案内容（--fields 挑字段，--short 出紧凑画像）
   list      全部档案一张表
-  check     用 1 次连接（只 cat boot_id）判断档案是否因重启而过期
+  check     用 1 次连接判断档案是否因重启而过期，并报告自上次采集的磁盘 IO 增量
   compare   本地对比两台或多台档案（-H a,b 或重复 -H）
   set       更新档案字段: set -H web1 note="..." key=value ...
   mark-stale 把某些段落标脏（改了服务之后调用，档案才不会悄悄过时）
@@ -806,7 +806,7 @@ do_check() {
 
   resolve_connection_meta "$f"
   build_run_args
-  RUN_ARGS+=(-t 20 -c 'cat /proc/sys/kernel/random/boot_id 2>/dev/null; cut -d. -f1 /proc/uptime 2>/dev/null' \
+  RUN_ARGS+=(-t 20 -c 'cat /proc/sys/kernel/random/boot_id 2>/dev/null; cut -d. -f1 /proc/uptime 2>/dev/null; echo __SSHMGR_DISKSTATS__; cat /proc/diskstats 2>/dev/null' \
              --label "profile-check $TARGET")
   local cur crc
   cur="$(bash "$SSH_EXEC" "${RUN_ARGS[@]}" 2>/dev/null)"
@@ -825,6 +825,46 @@ do_check() {
     exit 1
   fi
   ok "机器未重启，档案基线仍有效 (uptime ${new_up:-?}s)"
+
+  # 用档案里的 /proc/diskstats 扇区基线算增量（仅 boot_id 未变时有效）。
+  local cur_disk old_io cur_io io last_scan
+  cur_disk="$(printf '%s\n' "$cur" | sed -n '/^__SSHMGR_DISKSTATS__$/,$p' | sed '1d')"
+  if ! printf '%s\n' "$cur_disk" | grep -q .; then
+    printf '  磁盘 IO: 远端未返回 diskstats\n'
+    return 0
+  fi
+  old_io="$(mktemp "${TMPDIR:-/tmp}/sshmgr-io-old.XXXXXX" 2>/dev/null)" || old_io=""
+  cur_io="$(mktemp "${TMPDIR:-/tmp}/sshmgr-io-cur.XXXXXX" 2>/dev/null)" || cur_io=""
+  if [ -z "$old_io" ] || [ -z "$cur_io" ]; then
+    [ -n "$old_io" ] && rm -f "$old_io"
+    [ -n "$cur_io" ] && rm -f "$cur_io"
+    printf '  磁盘 IO: 临时文件创建失败，跳过\n'
+    return 0
+  fi
+  grep '^diskstat\.' "$f" 2>/dev/null | sed 's/^[^=]*=//' > "$old_io"
+  printf '%s\n' "$cur_disk" \
+    | awk '$3 ~ /^(sd|nvme|vd|hd|dm-)[a-z0-9-]*$/ {printf "%s|read=%s|written=%s\n", $3, $6, $10}' > "$cur_io"
+  last_scan="$(pget "$f" last_scan)"
+  if [ ! -s "$old_io" ]; then
+    printf '  磁盘 IO: 档案无 diskstat 基线（可 collect --sections storage 建立）\n'
+  else
+    io="$(awk -F'[|=]' '
+      NR==FNR { o[$1]=$3+0; w[$1]=$5+0; next }
+      $1 in o {
+        dr=$3-o[$1]; dw=$5-w[$1]
+        if (dr<0) dr=0
+        if (dw<0) dw=0
+        if (dr || dw) printf "  %-10s read=%6.1f MB  written=%6.1f MB\n", $1, dr*512/1048576, dw*512/1048576
+      }' "$old_io" "$cur_io" | head -10)"
+    if [ -n "$io" ]; then
+      printf '  磁盘 IO（自上次采集 %s）:\n' "${last_scan:-?}"
+      printf '%s\n' "$io"
+      printf '  %s（块设备与分区、LVM/mapper 可能重复计数）%s\n' "$C_DIM" "$C_OFF"
+    else
+      printf '  磁盘 IO: 自上次采集无增量（设备匹配 / 计数器未变）\n'
+    fi
+  fi
+  rm -f "$old_io" "$cur_io"
 }
 
 # ---------- compare ----------
@@ -965,6 +1005,13 @@ do_hint() {
   if [ -n "$st" ]; then
     printf '[档案已标脏: %s] 原因: %s — 需要时刷新: collect -H %s --sections %s\n' \
       "$st" "$(pget "$f" stale_reason)" "$TARGET" "$st"
+    return 0
+  fi
+  local cur old
+  cur="$(file_digest "$PROFILE_SH")"
+  old="$(pget "$f" collector_sha256)"
+  if [ -n "$old" ] && [ -n "$cur" ] && [ "$old" != "$cur" ]; then
+    printf '[采集器已更新] 档案由旧版 collector 生成；建议重新 collect -H %s（可先用 --sections 缩小范围）\n' "$TARGET"
     return 0
   fi
   return 0
