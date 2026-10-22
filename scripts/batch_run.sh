@@ -94,7 +94,7 @@ usage() {
   --password-env VAR     从环境变量读
   --credential-file F    从文件读（建议 0600）
   --use-saved-credential 读取之前 --save-credential 保存的口令
-  --save-credential      把口令存到 ~/.ssh-server-manager/credentials（默认不存）
+  --save-credential      按目标把口令存到 ~/.ssh-server-manager/credentials.d/（默认不存）
 USAGE
 }
 
@@ -318,8 +318,8 @@ HOSTS_RAW="$(printf '%s\n' "$HOSTS_RAW" | awk -F'|' -v ex="$EXCLUDE" -v du="$DEF
     if ($5 == "") $5 = dj
     if ($6 == "") $6 = di
     if (da != "") $7 = da
-    key = $2 "|" $4
-    if (key in seen) { print "batch_run: 跳过重复目标: " $1 " (" $2 ":" ($4 == "" ? 22 : $4) ")" > "/dev/stderr"; next }
+    key = $2 "|" $4 "|" $3
+    if (key in seen) { print "batch_run: 跳过重复目标: " $1 " (" ($3 == "" ? "?" : $3) "@" $2 ":" ($4 == "" ? 22 : $4) ")" > "/dev/stderr"; next }
     seen[key] = 1
     printf "%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7
   }

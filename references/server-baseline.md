@@ -23,7 +23,8 @@ So the division is explicit:
 ```
 ~/.ssh-server-manager/
 ├── audit.log              # audit log (one line per remote command)
-├── credentials            # optional: password (only created on explicit --save-credential)
+├── credentials.d/         # optional per-target passwords (explicit --save-credential)
+├── credentials            # legacy global password file (read-only fallback)
 ├── cm/                    # ControlMaster connection-multiplexing sockets
 └── profiles/
     ├── 203.0.113.10.profile        # named after the connection target

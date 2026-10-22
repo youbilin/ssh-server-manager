@@ -350,9 +350,11 @@ after you have confirmed the change. Non-22 ports get their own `<target>_<port>
 
 ## Security model
 
-- **Credentials are not persisted by default.** Only `--save-credential` writes
-  `~/.ssh-server-manager/credentials`; it is reused only when `--use-saved-credential` is given
-  explicitly, never implicitly. Storing nothing is the protection; file modes are not.
+- **Credentials are not persisted by default.** Only `--save-credential` writes a per-target file
+  under `~/.ssh-server-manager/credentials.d/`; it is reused only when
+  `--use-saved-credential` is given explicitly, never implicitly. The legacy global
+  `credentials` file is read as a fallback but is deprecated. Storing nothing is the
+  protection; file modes are not.
 - **`sshpass -p` is never used** — it exposes the password in `ps` output.
 - **`--selftest` and `--dry-run` do not read credentials** and cannot leave password temp files.
 - **`chmod 600` is often a no-op under Git-Bash.** Mounts there carry `noacl`, so permission bits do

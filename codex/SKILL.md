@@ -37,9 +37,10 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
 ```
 
 - **Passwords are not written to disk by default.** The user will say so if they want that;
-  at that point add `--save-credential` to store it in `~/.ssh-server-manager/credentials`.
-  Later invocations reuse it explicitly with `--use-saved-credential` — it is never read
-  implicitly. Don't store it if they didn't ask.
+  at that point add `--save-credential` to store it per target in
+  `~/.ssh-server-manager/credentials.d/<user_host_port>`. Later invocations reuse it explicitly
+  with `--use-saved-credential` — it is never read implicitly. The legacy global `credentials`
+  file is still readable but deprecated. Don't store it if they didn't ask.
 - **`--dry-run`, `--print-tier` and `--selftest` never read credentials and never connect.**
 - **Never use `sshpass -p`**: the password shows up in `ps` output. This script goes through
   ssh's own askpass; the password is handed to the helper via a private temp file that is

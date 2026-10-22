@@ -15,6 +15,7 @@ SSHMGR_TARGET_USER=""
 SSHMGR_TARGET_JUMP=""
 SSHMGR_TARGET_IDENTITY=""
 SSHMGR_TARGET_KH_FILE=""
+SSHMGR_TARGET_KH_FILES=""
 SSHMGR_TARGET_KH_ENTRY=""
 SSHMGR_TARGET_RESOLVED=0
 
@@ -49,6 +50,7 @@ sshmgr_resolve_target() {
   SSHMGR_TARGET_JUMP="$jump"
   SSHMGR_TARGET_IDENTITY="$identity"
   SSHMGR_TARGET_KH_FILE="${HOME}/.ssh/known_hosts"
+  SSHMGR_TARGET_KH_FILES="$SSHMGR_TARGET_KH_FILE"
   SSHMGR_TARGET_KH_ENTRY=""
   SSHMGR_TARGET_RESOLVED=0
 
@@ -83,13 +85,26 @@ sshmgr_resolve_target() {
   case "$v" in none|"") ;; *) SSHMGR_TARGET_JUMP="$v" ;; esac
   v="$(_sshmgr_target_get identityfile "$out")"
   [ -n "$v" ] && SSHMGR_TARGET_IDENTITY="$v"
-  v="$(_sshmgr_target_get1 userknownhostsfile "$out")"
+  v="$(_sshmgr_target_get userknownhostsfile "$out")"
   case "$v" in
-    none) SSHMGR_TARGET_KH_FILE="" ;;
-    "") ;;
-    # 这里匹配的是 ssh -G 输出里的字面量 "~/"；不是要展开本地路径。
-    "~/"*) SSHMGR_TARGET_KH_FILE="$HOME/${v#\~/}" ;;
-    *) SSHMGR_TARGET_KH_FILE="$v" ;;
+    none)
+      SSHMGR_TARGET_KH_FILE=""
+      SSHMGR_TARGET_KH_FILES=""
+      ;;
+    "")
+      ;;
+    *)
+      SSHMGR_TARGET_KH_FILE=""
+      SSHMGR_TARGET_KH_FILES=""
+      for _kh in $v; do
+        # ssh -G 输出里的 "~/" 是字面量，需要展开成本地路径。
+        case "$_kh" in
+          "~/"*) _kh="$HOME/${_kh#\~/}" ;;
+        esac
+        [ -n "$SSHMGR_TARGET_KH_FILE" ] || SSHMGR_TARGET_KH_FILE="$_kh"
+        SSHMGR_TARGET_KH_FILES="${SSHMGR_TARGET_KH_FILES}${SSHMGR_TARGET_KH_FILES:+ }$_kh"
+      done
+      ;;
   esac
 
   local alias

@@ -75,6 +75,7 @@ UPLOAD_REMOTE=""
 DOWNLOAD_REMOTE=""
 DOWNLOAD_LOCAL=""
 RECURSIVE=0
+TRANSFER_FORCE=0
 RSYNC_SSH_WRAPPER=""
 # 密码认证
 AUTH_MODE="auto"          # auto | key | password
@@ -93,7 +94,9 @@ TMP_FILES=()              # 所有临时文件统一登记，cleanup 逐个删�
 # 否则档案在一处、审计日志和凭据在另一处，排查时会找不到东西。
 LOG_DIR="${SSHMGR_HOME:-${SSHMGR_LOG_DIR:-$HOME/.ssh-server-manager}}"
 LOG_FILE="${SSHMGR_LOG:-$LOG_DIR/audit.log}"
-CRED_FILE_DEFAULT="$LOG_DIR/credentials"
+CRED_DIR="$LOG_DIR/credentials.d"
+CRED_FILE_DEFAULT="$LOG_DIR/credentials"      # 旧版全局凭据（只读兼容）
+CRED_FILE_TARGET=""                           # 按 目标/用户/端口 分离的凭据
 
 # ---------- 输出 helpers ----------
 if [ -t 1 ]; then
@@ -160,9 +163,10 @@ usage() {
       --upload LOCAL REMOTE
                          上传文件：LOCAL -> 远端 REMOTE（走同一套认证、审计与分级）
       --download REMOTE LOCAL
-                         下载文件：远端 REMOTE -> 本地 LOCAL
+                         下载文件：远端 REMOTE -> 本地 LOCAL。LOCAL 已存在时默认拒绝
       --recursive        配合 --upload/--download 传输目录（scp -r）
       --rsync            传输改用 rsync（支持断点续传；目标机需安装 rsync）
+      --force            允许 --download 覆盖已存在的本地路径（默认拒绝）
       --accept-host-key  首次连接时把远端指纹写入 known_hosts（须先人工核对指纹）
                          单独使用即可，不必同时给 -c；写入前必须提供 --fingerprint
       --show-host-key    只扫描并打印候选指纹，不写入 known_hosts
@@ -184,8 +188,8 @@ usage() {
       --credential-file F 从文件读口令（建议 0600；会剥掉行尾 CR）
       --prompt-credential 交互式输入口令（read -s，不进 shell history）
       --use-saved-credential
-                         读取 ~/.ssh-server-manager/credentials（配合 --save-credential）
-      --save-credential  把本次口令存到 ~/.ssh-server-manager/credentials（0600）。
+                         读取该目标（user@host:port）保存的口令；旧版全局 credentials 仍可读
+      --save-credential  把本次口令按目标存到 ~/.ssh-server-manager/credentials.d/（0600）。
                          默认**不**保存；只有你明确要免密时才加这个参数
 
 环境变量:
@@ -237,6 +241,7 @@ while [ $# -gt 0 ]; do
       TRANSFER_MODE="download"; DOWNLOAD_REMOTE="$2"; DOWNLOAD_LOCAL="$3"; shift 3 ;;
     --recursive)       RECURSIVE=1; shift ;;
     --rsync)           TRANSFER_TOOL="rsync"; shift ;;
+    --force)           TRANSFER_FORCE=1; shift ;;
     --no-log)          DO_LOG=0; shift ;;
     --label)           need_arg "$1" $#; LOG_LABEL="$2"; shift 2 ;;
     --selftest)        SELFTEST=1; shift ;;
@@ -301,6 +306,9 @@ fi
 if [ "$TRANSFER_TOOL" = "rsync" ] && [ -z "$TRANSFER_MODE" ]; then
   err "--rsync 只能配合 --upload/--download 使用"; exit 1
 fi
+if [ "$TRANSFER_FORCE" -eq 1 ] && [ "$TRANSFER_MODE" != "download" ]; then
+  err "--force 只用于 --download 覆盖本地已存在的路径"; exit 1
+fi
 if [ "$ACCEPT_HOST_KEY" -eq 1 ] && [ "$SHOW_HOST_KEY" -eq 1 ]; then
   err "--accept-host-key 与 --show-host-key 不能同时使用"; exit 1
 fi
@@ -359,6 +367,11 @@ if [ -n "$TRANSFER_MODE" ]; then
     [ -n "$DOWNLOAD_REMOTE" ] || { err "远端路径不能为空"; exit 1; }
     case "$DOWNLOAD_REMOTE" in *$'\n'*|*$'\r'*) err "远端路径包含换行"; exit 1 ;; esac
     [ -d "$(dirname "$DOWNLOAD_LOCAL")" ] || { err "本地目标目录不存在: $(dirname "$DOWNLOAD_LOCAL")"; exit 1; }
+    if [ -e "$DOWNLOAD_LOCAL" ] && [ "$TRANSFER_FORCE" -ne 1 ]; then
+      err "本地路径已存在: $DOWNLOAD_LOCAL"
+      say "  下载默认不覆盖本地文件；确认要覆盖时加 --force"
+      exit 1
+    fi
   fi
 fi
 
@@ -377,6 +390,10 @@ TARGET_LABEL="$HOST"
 if [ -n "$USER_NAME" ]; then
   TARGET="${USER_NAME}@${HOST}"
   TARGET_LABEL="$TARGET"
+fi
+if [ -n "$TARGET_LABEL" ]; then
+  _cred_key="$(printf '%s_%s' "$TARGET_LABEL" "${PORT:-22}" | tr -c 'A-Za-z0-9._-' '_')"
+  CRED_FILE_TARGET="$CRED_DIR/$_cred_key"
 fi
 
 if [ "$TRANSFER_MODE" = "upload" ]; then
@@ -595,9 +612,17 @@ resolve_password() {
     [ -n "$PASSWORD" ] && return 0
   fi
   if [ "$USE_SAVED_CREDENTIAL" -eq 1 ]; then
-    PASSWORD="$(read_credential_file "$CRED_FILE_DEFAULT")" || {
-      err "无法从 $CRED_FILE_DEFAULT 读到口令（先运行一次带 --save-credential 的命令）"; exit 1; }
-    return 0
+    if [ -n "$CRED_FILE_TARGET" ] && [ -r "$CRED_FILE_TARGET" ]; then
+      PASSWORD="$(read_credential_file "$CRED_FILE_TARGET")" || PASSWORD=""
+      [ -n "$PASSWORD" ] && return 0
+    fi
+    if [ -r "$CRED_FILE_DEFAULT" ]; then
+      warn "使用旧版全局凭据 $CRED_FILE_DEFAULT；建议重新 --save-credential 生成按目标的凭据。"
+      PASSWORD="$(read_credential_file "$CRED_FILE_DEFAULT")" || PASSWORD=""
+      [ -n "$PASSWORD" ] && return 0
+    fi
+    err "无法从 $CRED_FILE_TARGET（或旧版 $CRED_FILE_DEFAULT）读到口令（先运行一次带 --save-credential 的命令）"
+    exit 1
   fi
   if [ "$PROMPT_CREDENTIAL" -eq 1 ]; then
     [ -t 0 ] || [ -r /dev/tty ] || { err "--prompt-credential 需要终端"; exit 1; }
@@ -839,10 +864,13 @@ handle_host_key() {
   fi
 
   local kh="$SSHMGR_TARGET_KH_FILE" entry="$SSHMGR_TARGET_KH_ENTRY"
-  local oldfp="" oldfps=""
-  if [ -f "$kh" ]; then
-    oldfps="$(ssh-keygen -F "$entry" -f "$kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
-  fi
+  local oldfp="" oldfps="" _kh _fps
+  for _kh in ${SSHMGR_TARGET_KH_FILES:-$kh}; do
+    [ -f "$_kh" ] || continue
+    _fps="$(ssh-keygen -F "$entry" -f "$_kh" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+    [ -n "$_fps" ] && oldfps="${oldfps}${oldfps:+
+}${_fps}"
+  done
   if [ -n "$oldfps" ]; then
     if printf '%s\n' "$oldfps" | grep -Fxq "$FINGERPRINT"; then
       say "${C_GRN}known_hosts 里已有相同指纹，无需重复写入。${C_OFF}"
@@ -930,11 +958,21 @@ if [ "$SAVE_CREDENTIAL" -eq 1 ]; then
     warn "--save-credential 需要先在本次调用里提供口令，已忽略"
   else
     mkdir -p "$LOG_DIR" 2>/dev/null; chmod 700 "$LOG_DIR" 2>/dev/null || true
-    ( umask 077; cat "$PW_TMPFILE" > "$CRED_FILE_DEFAULT" ) && chmod 600 "$CRED_FILE_DEFAULT" 2>/dev/null
+    if [ -n "$CRED_FILE_TARGET" ]; then
+      mkdir -p "$CRED_DIR" 2>/dev/null; chmod 700 "$CRED_DIR" 2>/dev/null || true
+      _cred_dest="$CRED_FILE_TARGET"
+    else
+      _cred_dest="$CRED_FILE_DEFAULT"
+    fi
+    if ! ( umask 077; cat "$PW_TMPFILE" > "$_cred_dest" ); then
+      err "口令保存失败: $_cred_dest"
+      exit 1
+    fi
+    chmod 600 "$_cred_dest" 2>/dev/null
     # 别谎报权限：Git-Bash 的挂载多为 noacl，chmod 对权限位是空操作
     # （实测 chmod 600 与 777 之后 stat 都是 644）。说清实际情况比印一句"0600"有用。
-    _actual="$(stat -c '%a' "$CRED_FILE_DEFAULT" 2>/dev/null)"
-    say "${C_GRN}口令已保存到 $CRED_FILE_DEFAULT${C_OFF}"
+    _actual="$(stat -c '%a' "$_cred_dest" 2>/dev/null)"
+    say "${C_GRN}口令已保存到 $_cred_dest${C_OFF}"
     if [ "${_actual:-}" = "600" ] || [ "${_actual:-}" = "700" ]; then
       say "  文件权限已设为 ${_actual}。之后可用 --use-saved-credential 复用。"
     else

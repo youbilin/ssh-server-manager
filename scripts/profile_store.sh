@@ -441,10 +441,15 @@ resolve_connection_meta() { # $1=旧档案路径（可为空）
 
 # 读取客户端实际验证过的 known_hosts 指纹。
 target_fingerprint() {
-  [ -n "$EFF_KH_FILE" ] && [ -f "$EFF_KH_FILE" ] || return 0
   command -v ssh-keygen >/dev/null 2>&1 || return 0
-  ssh-keygen -F "$EFF_KH_ENTRY" -f "$EFF_KH_FILE" 2>/dev/null \
-    | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | head -1 | awk '{print $2}'
+  local kh fp
+  for kh in ${SSHMGR_TARGET_KH_FILES:-$EFF_KH_FILE}; do
+    [ -f "$kh" ] || continue
+    fp="$(ssh-keygen -F "$EFF_KH_ENTRY" -f "$kh" 2>/dev/null \
+      | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | head -1 | awk '{print $2}')"
+    [ -n "$fp" ] && { printf '%s\n' "$fp"; return 0; }
+  done
+  return 0
 }
 
 RUN_ARGS=()
@@ -897,7 +902,7 @@ do_compare() {
   }
   printf '%s\n' "═══ 档案对比 ═══"
   row "字段" "${HOSTS[@]}"
-  for pair in "os|系统" "kernel|内核" "virt|虚拟化" "cpu_model|CPU" "cpu_cores|物理核" "cpu_threads|线程" "mem_total_mb|内存MB" "dmi_product_name|机型" "ip_primary|主IP" "latency_avg_ms|延迟avg"; do
+  for pair in "os|系统" "kernel|内核" "init_system|服务管理" "virt|虚拟化" "cpu_model|CPU" "cpu_cores|物理核" "cpu_threads|线程" "cpu_sockets|插槽" "mem_total_mb|内存MB" "swap_total_mb|SwapMB" "dmi_product_name|机型" "ip_primary|主IP" "pkg_manager|包管理器" "firewall|防火墙" "docker_containers|Docker" "latency_avg_ms|延迟avg"; do
     local field="${pair%%|*}" label="${pair#*|}"
     local -a VALS=()
     for f in "${PFILES[@]}"; do

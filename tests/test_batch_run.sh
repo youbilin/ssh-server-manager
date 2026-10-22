@@ -60,6 +60,11 @@ out="$(bash "$BR" --hosts-file "$SANDBOX/dupes.txt" --cmd 'uptime' 2>&1)"
 assert_contains "跳过重复目标" "$out" "duplicate warning"
 assert_contains "目标清单（1 台）" "$out" "duplicate target list"
 
+CURRENT_TEST="same host different users"
+printf 'web1 22 deploy\nweb1 22 root\n' > "$SANDBOX/users.txt"
+out="$(bash "$BR" --hosts-file "$SANDBOX/users.txt" --cmd 'uptime' 2>&1)"
+assert_contains "目标清单（2 台）" "$out" "different users must not be deduped"
+
 # 3. Malicious-looking labels cannot escape the output directory.
 CURRENT_TEST="label path safety"
 printf '../../escape\n' > "$SANDBOX/traversal.txt"

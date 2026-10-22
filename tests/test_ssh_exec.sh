@@ -132,20 +132,28 @@ export SAVE_PW='save-me-please'
 out="$(sv -H example.invalid --auth password --password-env SAVE_PW --save-credential --no-preflight -c 'true')"
 rc=$?
 assert_rc 0 "$rc" "save-credential execution: $out"
-assert_eq "save-me-please" "$(head -1 "$SSHMGR_HOME/credentials" 2>/dev/null)" "saved credential content"
+assert_eq "save-me-please" "$(head -1 "$SSHMGR_HOME/credentials.d/example.invalid_22" 2>/dev/null)" "saved credential content"
 assert_not_contains "save-me-please" "$(cat "$FAKE_SSH_LOG")" "password must not be on argv"
 assert_eq "0" "$(find "$TMPDIR" -maxdepth 1 -name 'sshmgr-*' 2>/dev/null | wc -l | tr -d ' ')" "no temp files after saving"
 
-# 7. Saved credential is reused, and never appears in ssh argv.
+# 7. Saved credential is reused per target, and never appears in ssh argv.
 CURRENT_TEST="saved credential"
-printf 'saved-secret\n' > "$SSHMGR_HOME/credentials"
 export FAKE_SSH_G_PORT="22"
 : > "$FAKE_SSH_LOG"
 out="$(sv -H example.invalid --auth password --use-saved-credential --no-preflight -c 'true')"
 rc=$?
 assert_rc 0 "$rc" "saved credential execution: $out"
-assert_not_contains "saved-secret" "$(cat "$FAKE_SSH_LOG")" "password must not appear in argv"
+assert_not_contains "save-me-please" "$(cat "$FAKE_SSH_LOG")" "password must not appear in argv"
 assert_eq "0" "$(find "$TMPDIR" -maxdepth 1 -name 'sshmgr-*' 2>/dev/null | wc -l | tr -d ' ')" "no temp files after execution"
+
+CURRENT_TEST="legacy credential fallback"
+printf 'legacy-secret\n' > "$SSHMGR_HOME/credentials"
+: > "$FAKE_SSH_LOG"
+out="$(sv -H legacy.invalid --auth password --use-saved-credential --no-preflight -c 'true')"
+rc=$?
+assert_rc 0 "$rc" "legacy credential execution: $out"
+assert_contains "旧版全局凭据" "$out" "legacy fallback warning"
+assert_not_contains "legacy-secret" "$(cat "$FAKE_SSH_LOG")" "legacy password must not appear in argv"
 
 # 8. Without GNU timeout, the built-in watchdog still bounds execution time.
 CURRENT_TEST="watchdog fallback"
@@ -211,6 +219,18 @@ out="$(sv -H example.invalid --auth key --download /tmp/remote.txt "$DL")"
 rc=$?
 assert_rc 0 "$rc" "download rc: $out"
 assert_contains "example.invalid:/tmp/remote.txt" "$(cat "$FAKE_SCP_LOG")" "scp should receive the remote source"
+
+CURRENT_TEST="download overwrite guard"
+: > "$FAKE_SCP_LOG"
+printf 'existing\n' > "$DL"
+out="$(sv -H example.invalid --auth key --download /tmp/remote.txt "$DL")"
+rc=$?
+assert_rc 1 "$rc" "existing local file should be refused"
+assert_contains "--force" "$out" "overwrite hint"
+assert_eq "0" "$(wc -l < "$FAKE_SCP_LOG" | tr -d ' ')" "scp must not run when local exists"
+out="$(sv -H example.invalid --auth key --download /tmp/remote.txt "$DL" --force)"
+rc=$?
+assert_rc 0 "$rc" "--force download rc: $out"
 
 CURRENT_TEST="recursive transfer"
 : > "$FAKE_SCP_LOG"
